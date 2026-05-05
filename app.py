@@ -318,7 +318,7 @@ def calculate_metrics(operations: List[str]):
     correct = operations.count("correct")
 
     if total_reference_units > 0:
-        per = ((substitutions + deletions + insertions) / total_reference_units) * 100
+        per =min(100, ((substitutions + deletions + insertions) / total_reference_units) * 100)
     else:
         per = 0
 
