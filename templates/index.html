@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pronunciation Feedback System</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <main class="container">
+        <section class="hero">
+            <div>
+                <p class="badge">Wav2Vec2 + G2P + DP Alignment</p>
+                <h1>Pronunciation Feedback System</h1>
+                <p class="subtitle">
+                    Enter English text, record your voice, and compare expected phonemes with your spoken phonemes.
+                </p>
+            </div>
+        </section>
+
+        <section class="card input-card">
+            <label for="textInput">Sentence</label>
+            <textarea id="textInput" placeholder="Example: school is open"></textarea>
+
+            <div class="buttons">
+                <button id="startBtn">Start Recording</button>
+                <button id="stopBtn" disabled>Stop Recording</button>
+                <button id="analyzeBtn" disabled>Analyze</button>
+            </div>
+
+            <audio id="audioPlayback" controls></audio>
+            <p id="statusText" class="status">Ready.</p>
+        </section>
+
+        <section id="loading" class="loading hidden">
+            Analyzing pronunciation...
+        </section>
+
+        <section id="results" class="hidden">
+            <h2>Results</h2>
+
+            <div class="results-grid">
+                <div class="result-box">
+                    <h3>Expected Phonemes</h3>
+                    <p id="referenceIpa"></p>
+                </div>
+
+                <div class="result-box">
+                    <h3>Spoken Phonemes</h3>
+                    <p id="predictedIpa"></p>
+                </div>
+            </div>
+
+            <div class="metrics">
+                <div>
+                    <strong>Correct</strong>
+                    <span id="correctCount"></span>
+                </div>
+                <div>
+                    <strong>Substitutions</strong>
+                    <span id="subCount"></span>
+                </div>
+                <div>
+                    <strong>Deletions</strong>
+                    <span id="delCount"></span>
+                </div>
+                <div>
+                    <strong>Insertions</strong>
+                    <span id="insCount"></span>
+                </div>
+                <div>
+                    <strong>PER</strong>
+                    <span id="perValue"></span>
+                </div>
+            </div>
+
+            <h3 class="table-title">Phoneme Alignment</h3>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Expected</th>
+                            <th>Spoken</th>
+                            <th>Result</th>
+                        </tr>
+                    </thead>
+                    <tbody id="alignmentTable"></tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

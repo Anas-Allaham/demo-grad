@@ -1,0 +1,8 @@
+Put your trained Wav2Vec2 model files in this folder.
+
+Expected files include:
+- config.json
+- vocab.json
+- tokenizer_config.json
+- preprocessor_config.json
+- model.safetensors or pytorch_model.bin

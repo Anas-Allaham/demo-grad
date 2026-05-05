@@ -1,0 +1,8 @@
+flask
+transformers
+torch
+librosa
+soundfile
+numpy
+spacy
+nemo_toolkit[tts]
