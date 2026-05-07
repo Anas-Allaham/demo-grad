@@ -4,6 +4,8 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Dict, List
+import noisereduce as nr
+import soundfile as sf
 
 import librosa
 import torch
@@ -213,13 +215,47 @@ def ipa_to_tokens(ipa: str) -> List[str]:
 # -----------------------------
 # Audio to Phonemes using Wav2Vec2
 # -----------------------------
+# def transcribe_audio_to_phonemes(audio_path: Path) -> str:
+#     load_wav2vec_model()
+
+#     audio_array, _ = librosa.load(str(audio_path), sr=16000, mono=True)
+
+#     inputs = processor(
+#         audio_array,
+#         sampling_rate=16000,
+#         return_tensors="pt",
+#         padding=True,
+#     )
+
+#     input_values = inputs.input_values.to(device)
+
+#     with torch.no_grad():
+#         logits = model(input_values).logits
+
+#     predicted_ids = torch.argmax(logits, dim=-1)
+#     predicted_ipa = processor.batch_decode(predicted_ids)[0]
+
+#     return normalize_ipa(predicted_ipa)
+
 def transcribe_audio_to_phonemes(audio_path: Path) -> str:
     load_wav2vec_model()
 
-    audio_array, _ = librosa.load(str(audio_path), sr=16000, mono=True)
+    audio_array, sr = librosa.load(
+        str(audio_path),
+        sr=16000,
+        mono=True
+    )
+
+    reduced_noise = nr.reduce_noise(
+        y=audio_array,
+        sr=sr
+    )
+
+    clean_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
+    sf.write(str(clean_path), reduced_noise, sr)
 
     inputs = processor(
-        audio_array,
+        reduced_noise,
         sampling_rate=16000,
         return_tensors="pt",
         padding=True,
@@ -234,7 +270,6 @@ def transcribe_audio_to_phonemes(audio_path: Path) -> str:
     predicted_ipa = processor.batch_decode(predicted_ids)[0]
 
     return normalize_ipa(predicted_ipa)
-
 
 # -----------------------------
 # Dynamic Programming Alignment
