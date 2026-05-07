@@ -1,4 +1,5 @@
 import numpy as np
+import unicodedata
 
 # Feature vector format:
 # [
@@ -88,6 +89,44 @@ PHONEME_VECTORS = {
     "ɔɪ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,1,0,1,1],
 }
 
+PHONEME_ALIASES = {
+    # Common Unicode/IPA symbol variants that should be treated as equivalent.
+    "g": "ɡ",
+    "ɚ": "ɝ",
+    "ɜː": "ɝ",
+    "ɜ:": "ɝ",
+    "ə˞": "ɝ",
+    "˞": "",
+    "ɑː": "ɑ",
+    "ɑ:": "ɑ",
+    "ɔː": "ɔ",
+    "ɔ:": "ɔ",
+    "u:": "uː",
+    "i:": "iː",
+}
+
+
+def canonicalize_phoneme(phoneme: str) -> str:
+    """
+    Normalize one phoneme token so visually/semantically equivalent symbols
+    map to one canonical form before distance scoring.
+    """
+    ph = unicodedata.normalize("NFC", str(phoneme)).strip()
+    if not ph:
+        return ph
+
+    # Normalize alternate length mark encoding.
+    ph = ph.replace(":", "ː")
+
+    # Resolve aliases (supports short alias chains).
+    for _ in range(3):
+        mapped = PHONEME_ALIASES.get(ph)
+        if mapped is None or mapped == ph:
+            break
+        ph = mapped
+
+    return ph
+
 
 def phoneme_distance(a: str, b: str) -> float:
     """
@@ -95,6 +134,9 @@ def phoneme_distance(a: str, b: str) -> float:
     0.0 = same phoneme
     closer to 1.0 = more different
     """
+    a = canonicalize_phoneme(a)
+    b = canonicalize_phoneme(b)
+
     if a == b:
         return 0.0
 
