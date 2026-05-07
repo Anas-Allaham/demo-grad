@@ -345,22 +345,22 @@ def transcribe_audio_to_phonemes(audio_path: Path) -> str:
 #     return aligned_ref, aligned_hyp, operations
 
 
-def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
+def align_phonemes(ref_seq, hyp_seq):
     n = len(ref_seq)
     m = len(hyp_seq)
 
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     backtrack = [[None] * (m + 1) for _ in range(n + 1)]
 
-    gap_penalty = -1.0
-    match_score = 2.0
+    deletion_cost = 1.0
+    insertion_cost = 1.0
 
     for i in range(1, n + 1):
-        dp[i][0] = i * gap_penalty
+        dp[i][0] = i * deletion_cost
         backtrack[i][0] = "UP"
 
     for j in range(1, m + 1):
-        dp[0][j] = j * gap_penalty
+        dp[0][j] = j * insertion_cost
         backtrack[0][j] = "LEFT"
 
     for i in range(1, n + 1):
@@ -368,24 +368,25 @@ def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
             ref_ph = ref_seq[i - 1]
             hyp_ph = hyp_seq[j - 1]
 
-            if ref_ph == hyp_ph:
-                diag = dp[i - 1][j - 1] + match_score
-            else:
-                distance = phoneme_distance(ref_ph, hyp_ph)
-                diag = dp[i - 1][j - 1] - distance
+            sub_cost = phoneme_distance(ref_ph, hyp_ph)
 
-            up = dp[i - 1][j] + gap_penalty
-            left = dp[i][j - 1] + gap_penalty
+            diag = dp[i - 1][j - 1] + sub_cost
+            up = dp[i - 1][j] + deletion_cost
+            left = dp[i][j - 1] + insertion_cost
 
-            best = max(diag, up, left)
+            best = min(diag, up, left)
             dp[i][j] = best
 
-            if best == diag:
+            # Tie-breaking:
+            # Prefer exact match, then deletion/insertion, then substitution.
+            if ref_ph == hyp_ph and diag == best:
                 backtrack[i][j] = "DIAG"
-            elif best == up:
+            elif up == best:
                 backtrack[i][j] = "UP"
-            else:
+            elif left == best:
                 backtrack[i][j] = "LEFT"
+            else:
+                backtrack[i][j] = "DIAG"
 
     aligned_ref = []
     aligned_hyp = []
@@ -400,23 +401,20 @@ def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
         if move == "DIAG":
             ref_ph = ref_seq[i - 1]
             hyp_ph = hyp_seq[j - 1]
+            dist = phoneme_distance(ref_ph, hyp_ph)
 
             aligned_ref.append(ref_ph)
             aligned_hyp.append(hyp_ph)
+            distances.append(round(dist, 3))
 
-            if ref_ph == hyp_ph:
+            if dist == 0:
                 operations.append("correct")
-                distances.append(0.0)
+            elif dist <= 0.25:
+                operations.append("minor_substitution")
+            elif dist <= 0.50:
+                operations.append("medium_substitution")
             else:
-                dist = phoneme_distance(ref_ph, hyp_ph)
-                distances.append(round(dist, 3))
-
-                if dist <= 0.25:
-                    operations.append("minor_substitution")
-                elif dist <= 0.50:
-                    operations.append("medium_substitution")
-                else:
-                    operations.append("major_substitution")
+                operations.append("major_substitution")
 
             i -= 1
             j -= 1
@@ -434,9 +432,6 @@ def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
             operations.append("insertion")
             distances.append(1.0)
             j -= 1
-
-        else:
-            break
 
     aligned_ref.reverse()
     aligned_hyp.reverse()
