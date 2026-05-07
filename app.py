@@ -7,6 +7,7 @@ from typing import Dict, List
 import noisereduce as nr
 import soundfile as sf
 
+from phoneme_vectors import phoneme_distance
 import librosa
 import torch
 from flask import Flask, jsonify, render_template, request
@@ -274,16 +275,85 @@ def transcribe_audio_to_phonemes(audio_path: Path) -> str:
 # -----------------------------
 # Dynamic Programming Alignment
 # -----------------------------
+# def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
+#     n = len(ref_seq)
+#     m = len(hyp_seq)
+
+#     dp = [[0] * (m + 1) for _ in range(n + 1)]
+#     backtrack = [[None] * (m + 1) for _ in range(n + 1)]
+
+#     gap_penalty = -1
+#     match_score = 2
+#     mismatch_penalty = -1
+
+#     for i in range(1, n + 1):
+#         dp[i][0] = i * gap_penalty
+#         backtrack[i][0] = "UP"
+
+#     for j in range(1, m + 1):
+#         dp[0][j] = j * gap_penalty
+#         backtrack[0][j] = "LEFT"
+
+#     for i in range(1, n + 1):
+#         for j in range(1, m + 1):
+#             diag = dp[i - 1][j - 1] + (match_score if ref_seq[i - 1] == hyp_seq[j - 1] else mismatch_penalty)
+#             up = dp[i - 1][j] + gap_penalty
+#             left = dp[i][j - 1] + gap_penalty
+
+#             best = max(diag, up, left)
+#             dp[i][j] = best
+
+#             if best == diag:
+#                 backtrack[i][j] = "DIAG"
+#             elif best == up:
+#                 backtrack[i][j] = "UP"
+#             else:
+#                 backtrack[i][j] = "LEFT"
+
+#     aligned_ref = []
+#     aligned_hyp = []
+#     operations = []
+
+#     i, j = n, m
+#     while i > 0 or j > 0:
+#         move = backtrack[i][j]
+
+#         if move == "DIAG":
+#             ref_ph = ref_seq[i - 1]
+#             hyp_ph = hyp_seq[j - 1]
+#             aligned_ref.append(ref_ph)
+#             aligned_hyp.append(hyp_ph)
+#             operations.append("correct" if ref_ph == hyp_ph else "substitution")
+#             i -= 1
+#             j -= 1
+#         elif move == "UP":
+#             aligned_ref.append(ref_seq[i - 1])
+#             aligned_hyp.append("-")
+#             operations.append("deletion")
+#             i -= 1
+#         elif move == "LEFT":
+#             aligned_ref.append("-")
+#             aligned_hyp.append(hyp_seq[j - 1])
+#             operations.append("insertion")
+#             j -= 1
+#         else:
+#             break
+
+#     aligned_ref.reverse()
+#     aligned_hyp.reverse()
+#     operations.reverse()
+#     return aligned_ref, aligned_hyp, operations
+
+
 def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
     n = len(ref_seq)
     m = len(hyp_seq)
 
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     backtrack = [[None] * (m + 1) for _ in range(n + 1)]
 
-    gap_penalty = -1
-    match_score = 2
-    mismatch_penalty = -1
+    gap_penalty = -1.0
+    match_score = 2.0
 
     for i in range(1, n + 1):
         dp[i][0] = i * gap_penalty
@@ -295,7 +365,15 @@ def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
 
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            diag = dp[i - 1][j - 1] + (match_score if ref_seq[i - 1] == hyp_seq[j - 1] else mismatch_penalty)
+            ref_ph = ref_seq[i - 1]
+            hyp_ph = hyp_seq[j - 1]
+
+            if ref_ph == hyp_ph:
+                diag = dp[i - 1][j - 1] + match_score
+            else:
+                distance = phoneme_distance(ref_ph, hyp_ph)
+                diag = dp[i - 1][j - 1] - distance
+
             up = dp[i - 1][j] + gap_penalty
             left = dp[i][j - 1] + gap_penalty
 
@@ -312,59 +390,119 @@ def align_phonemes(ref_seq: List[str], hyp_seq: List[str]):
     aligned_ref = []
     aligned_hyp = []
     operations = []
+    distances = []
 
     i, j = n, m
+
     while i > 0 or j > 0:
         move = backtrack[i][j]
 
         if move == "DIAG":
             ref_ph = ref_seq[i - 1]
             hyp_ph = hyp_seq[j - 1]
+
             aligned_ref.append(ref_ph)
             aligned_hyp.append(hyp_ph)
-            operations.append("correct" if ref_ph == hyp_ph else "substitution")
+
+            if ref_ph == hyp_ph:
+                operations.append("correct")
+                distances.append(0.0)
+            else:
+                dist = phoneme_distance(ref_ph, hyp_ph)
+                distances.append(round(dist, 3))
+
+                if dist <= 0.25:
+                    operations.append("minor_substitution")
+                elif dist <= 0.50:
+                    operations.append("medium_substitution")
+                else:
+                    operations.append("major_substitution")
+
             i -= 1
             j -= 1
+
         elif move == "UP":
             aligned_ref.append(ref_seq[i - 1])
             aligned_hyp.append("-")
             operations.append("deletion")
+            distances.append(1.0)
             i -= 1
+
         elif move == "LEFT":
             aligned_ref.append("-")
             aligned_hyp.append(hyp_seq[j - 1])
             operations.append("insertion")
+            distances.append(1.0)
             j -= 1
+
         else:
             break
 
     aligned_ref.reverse()
     aligned_hyp.reverse()
     operations.reverse()
-    return aligned_ref, aligned_hyp, operations
+    distances.reverse()
+
+    return aligned_ref, aligned_hyp, operations, distances
+
+# def calculate_metrics(operations: List[str]):
+#     total_reference_units = len([op for op in operations if op != "insertion"])
+
+#     substitutions = operations.count("substitution")
+#     deletions = operations.count("deletion")
+#     insertions = operations.count("insertion")
+#     correct = operations.count("correct")
+
+#     if total_reference_units > 0:
+#         per =min(100, ((substitutions + deletions + insertions) / total_reference_units) * 100)
+#     else:
+#         per = 0
+
+#     return {
+#         "correct": correct,
+#         "substitutions": substitutions,
+#         "deletions": deletions,
+#         "insertions": insertions,
+#         "phoneme_error_rate": round(per, 2),
+#     }
 
 
 def calculate_metrics(operations: List[str]):
     total_reference_units = len([op for op in operations if op != "insertion"])
 
-    substitutions = operations.count("substitution")
+    minor = operations.count("minor_substitution")
+    medium = operations.count("medium_substitution")
+    major = operations.count("major_substitution")
+
+    substitutions = minor + medium + major
     deletions = operations.count("deletion")
     insertions = operations.count("insertion")
     correct = operations.count("correct")
 
+    # Weighted phoneme error rate
+    weighted_error = (
+        minor * 0.33 +
+        medium * 0.66 +
+        major * 1.0 +
+        deletions * 1.0 +
+        insertions * 1.0
+    )
+
     if total_reference_units > 0:
-        per =min(100, ((substitutions + deletions + insertions) / total_reference_units) * 100)
+        per = min(100, (weighted_error / total_reference_units) * 100)
     else:
         per = 0
 
     return {
         "correct": correct,
         "substitutions": substitutions,
+        "minor_substitutions": minor,
+        "medium_substitutions": medium,
+        "major_substitutions": major,
         "deletions": deletions,
         "insertions": insertions,
         "phoneme_error_rate": round(per, 2),
     }
-
 
 # -----------------------------
 # Routes
@@ -424,15 +562,16 @@ def analyze():
         ref_seq = ipa_to_tokens(reference_ipa)
         hyp_seq = ipa_to_tokens(predicted_ipa)
 
-        aligned_ref, aligned_hyp, operations = align_phonemes(ref_seq, hyp_seq)
+        aligned_ref, aligned_hyp, operations, distances = align_phonemes(ref_seq, hyp_seq)
         metrics = calculate_metrics(operations)
 
         alignment = []
-        for ref, hyp, op in zip(aligned_ref, aligned_hyp, operations):
+        for ref, hyp, op, dist in zip(aligned_ref, aligned_hyp, operations, distances):
             alignment.append({
-                "expected": ref,
-                "spoken": hyp,
-                "result": op,
+            "expected": ref,
+            "spoken": hyp,
+            "result": op,
+            "distance": dist,
             })
 
         return jsonify({

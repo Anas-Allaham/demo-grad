@@ -203,7 +203,10 @@ th {
     font-weight: 800;
 }
 
-.substitution {
+.substitution,
+.minor_substitution,
+.medium_substitution,
+.major_substitution {
     color: #c2410c;
     font-weight: 800;
 }
