@@ -26,6 +26,8 @@
                 <button id="startBtn">Start Recording</button>
                 <button id="stopBtn" disabled>Stop Recording</button>
                 <button id="analyzeBtn" disabled>Analyze</button>
+                <button id="readTextBtn" class="secondary-button" type="button">Read Text</button>
+                <button id="stopReadBtn" class="secondary-button" type="button" disabled>Stop Reading</button>
             </div>
 
             <audio id="audioPlayback" controls></audio>
@@ -49,6 +51,17 @@
                     <h3>Spoken Phonemes</h3>
                     <p id="predictedIpa"></p>
                 </div>
+            </div>
+
+            <div class="result-box guide-box">
+                <div class="guide-header">
+                    <div>
+                        <h3>How to Read the Expected Phonemes</h3>
+                        <p class="guide-subtitle">Each word is separated by <strong>|</strong>. Open the guide to see how each IPA symbol sounds.</p>
+                    </div>
+                    <button id="toggleGuideBtn" class="secondary-button" type="button">Show Reader</button>
+                </div>
+                <div id="readingGuide" class="hidden"></div>
             </div>
 
             <div class="metrics">
@@ -82,6 +95,7 @@
                             <th>Expected</th>
                             <th>Spoken</th>
                             <th>Result</th>
+                            <th>Distance</th>
                         </tr>
                     </thead>
                     <tbody id="alignmentTable"></tbody>

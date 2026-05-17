@@ -1,96 +1,37 @@
-import numpy as np
+"""
+Research-based IPA phoneme distance for pronunciation feedback.
+
+Primary method:
+- PanPhon articulatory feature vectors and weighted feature edit distance.
+- Paper: Mortensen et al. (2016), "PanPhon: A Resource for Mapping IPA Segments
+  to Articulatory Feature Vectors".
+
+Fallback:
+- A very small feature fallback is included only so the app can still run if PanPhon
+  is not installed. For final/report use, install panphon.
+"""
+
+from __future__ import annotations
+
+import itertools
 import unicodedata
+from functools import lru_cache
+from typing import Dict, List
 
-# Feature vector format:
-# [
-#   is_vowel,
-#   is_consonant,
-#   voiced,
-#   bilabial,
-#   labiodental,
-#   dental,
-#   alveolar,
-#   postalveolar,
-#   palatal,
-#   velar,
-#   glottal,
-#   stop,
-#   fricative,
-#   affricate,
-#   nasal,
-#   liquid,
-#   glide,
-#   high_vowel,
-#   mid_vowel,
-#   low_vowel,
-#   front_vowel,
-#   central_vowel,
-#   back_vowel,
-#   rounded,
-# ]
+# The app mostly needs American-English IPA phonemes produced by the bundled G2P
+# and your Wav2Vec2 model.
+KNOWN_IPA_PHONEMES = [
+    "p", "b", "t", "d", "k", "ɡ", "g",
+    "f", "v", "θ", "ð", "s", "z", "ʃ", "ʒ", "h",
+    "tʃ", "dʒ",
+    "m", "n", "ŋ",
+    "l", "ɹ", "r", "w", "j",
+    "i", "iː", "ɪ", "e", "ɛ", "æ", "ɑ", "ɔ", "ʊ", "u", "uː", "ʌ", "ə", "ɝ", "ɚ",
+    "aɪ", "aʊ", "eɪ", "oʊ", "ɔɪ",
+]
 
-PHONEME_VECTORS = {
-    # Stops
-    "p": [0,1,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-    "b": [0,1,1,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-    "t": [0,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-    "d": [0,1,1,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-    "k": [0,1,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-    "ɡ": [0,1,1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0],
-
-    # Fricatives
-    "f": [0,1,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "v": [0,1,1,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "θ": [0,1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "ð": [0,1,1,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "s": [0,1,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "z": [0,1,1,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "ʃ": [0,1,0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "ʒ": [0,1,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-    "h": [0,1,0,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0],
-
-    # Affricates
-    "tʃ": [0,1,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0],
-    "dʒ": [0,1,1,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0],
-
-    # Nasals
-    "m": [0,1,1,1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0],
-    "n": [0,1,1,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0],
-    "ŋ": [0,1,1,0,0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0],
-
-    # Liquids / glides
-    "l": [0,1,1,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0],
-    "ɹ": [0,1,1,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0],
-    "r": [0,1,1,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0],
-    "w": [0,1,1,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,1,1],
-    "j": [0,1,1,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0],
-
-    # Vowels
-    "i": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0],
-    "iː": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0],
-    "ɪ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0],
-    "e": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0,0],
-    "ɛ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0,0],
-    "æ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0],
-    "ɑ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0],
-    "ɔ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,1],
-    "ʊ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1,1],
-    "u": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1,1],
-    "uː": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1,1],
-    "ʌ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0],
-    "ə": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0],
-    "ɝ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0],
-
-    # Diphthongs
-    "aɪ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,1,0],
-    "aʊ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1],
-    "eɪ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,1,0,0,0],
-    "oʊ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,1,1],
-    "ɔɪ": [1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,1,0,1,1],
-}
-
-PHONEME_ALIASES = {
-    # Common Unicode/IPA symbol variants that should be treated as equivalent.
+PHONEME_ALIASES: Dict[str, str] = {
+    # Common Unicode/IPA symbol variants.
     "g": "ɡ",
     "ɚ": "ɝ",
     "ɜː": "ɝ",
@@ -103,36 +44,107 @@ PHONEME_ALIASES = {
     "ɔ:": "ɔ",
     "u:": "uː",
     "i:": "iː",
+    "ɫ": "l",
+}
+
+# Tiny fallback feature set. This is not used when PanPhon is installed.
+FALLBACK_CLASSES = {
+    "vowels": {"i", "iː", "ɪ", "e", "ɛ", "æ", "ɑ", "ɔ", "ʊ", "u", "uː", "ʌ", "ə", "ɝ", "aɪ", "aʊ", "eɪ", "oʊ", "ɔɪ"},
+    "stops": {"p", "b", "t", "d", "k", "ɡ"},
+    "fricatives": {"f", "v", "θ", "ð", "s", "z", "ʃ", "ʒ", "h"},
+    "affricates": {"tʃ", "dʒ"},
+    "nasals": {"m", "n", "ŋ"},
+    "liquids": {"l", "ɹ", "r"},
+    "glides": {"w", "j"},
+    "lateral": {"l"},
+    "rhotic": {"ɹ", "r"},
+    "voiced": {"b", "d", "ɡ", "v", "ð", "z", "ʒ", "dʒ", "m", "n", "ŋ", "l", "ɹ", "r", "w", "j"},
+    "bilabial": {"p", "b", "m"},
+    "labiodental": {"f", "v"},
+    "dental": {"θ", "ð"},
+    "alveolar": {"t", "d", "s", "z", "n", "l", "ɹ", "r"},
+    "postalveolar": {"ʃ", "ʒ", "tʃ", "dʒ"},
+    "velar": {"k", "ɡ", "ŋ", "w"},
+    "front_vowels": {"i", "iː", "ɪ", "e", "ɛ", "æ", "eɪ"},
+    "central_vowels": {"ʌ", "ə", "ɝ"},
+    "back_vowels": {"ɑ", "ɔ", "ʊ", "u", "uː", "oʊ"},
 }
 
 
 def canonicalize_phoneme(phoneme: str) -> str:
-    """
-    Normalize one phoneme token so visually/semantically equivalent symbols
-    map to one canonical form before distance scoring.
-    """
+    """Normalize one IPA token before distance scoring."""
     ph = unicodedata.normalize("NFC", str(phoneme)).strip()
     if not ph:
         return ph
-
-    # Normalize alternate length mark encoding.
     ph = ph.replace(":", "ː")
-
-    # Resolve aliases (supports short alias chains).
-    for _ in range(3):
+    for _ in range(4):
         mapped = PHONEME_ALIASES.get(ph)
         if mapped is None or mapped == ph:
             break
         ph = mapped
-
     return ph
+
+
+@lru_cache(maxsize=1)
+def _panphon_distance_object():
+    try:
+        from panphon.distance import Distance
+        return Distance()
+    except Exception:
+        return None
+
+
+def panphon_available() -> bool:
+    return _panphon_distance_object() is not None
+
+
+@lru_cache(maxsize=1)
+def _max_panphon_substitution_distance() -> float:
+    """Normalize PanPhon substitution distances over the app's IPA inventory."""
+    distance = _panphon_distance_object()
+    if distance is None:
+        return 1.0
+
+    phonemes = sorted({canonicalize_phoneme(p) for p in KNOWN_IPA_PHONEMES if canonicalize_phoneme(p)})
+    max_dist = 0.0
+
+    for a, b in itertools.combinations(phonemes, 2):
+        try:
+            raw = float(distance.weighted_feature_edit_distance(a, b))
+            if raw > max_dist:
+                max_dist = raw
+        except Exception:
+            continue
+
+    return max(max_dist, 1.0)
+
+
+def _fallback_vector(phoneme: str) -> List[int]:
+    phoneme = canonicalize_phoneme(phoneme)
+    return [1 if phoneme in members else 0 for members in FALLBACK_CLASSES.values()]
+
+
+def _fallback_distance(a: str, b: str) -> float:
+    a = canonicalize_phoneme(a)
+    b = canonicalize_phoneme(b)
+    if a == b:
+        return 0.0
+
+    va = _fallback_vector(a)
+    vb = _fallback_vector(b)
+    if not any(va) or not any(vb):
+        return 1.0
+
+    diff = sum(1 for x, y in zip(va, vb) if x != y)
+    return min(1.0, diff / max(len(va), 1))
 
 
 def phoneme_distance(a: str, b: str) -> float:
     """
-    Distance between two phonemes.
-    0.0 = same phoneme
-    closer to 1.0 = more different
+    Return a normalized distance between two IPA phonemes.
+
+    0.0 means identical phoneme.
+    1.0 means maximally different or unknown.
     """
     a = canonicalize_phoneme(a)
     b = canonicalize_phoneme(b)
@@ -140,10 +152,22 @@ def phoneme_distance(a: str, b: str) -> float:
     if a == b:
         return 0.0
 
-    if a not in PHONEME_VECTORS or b not in PHONEME_VECTORS:
+    distance = _panphon_distance_object()
+    if distance is None:
+        return _fallback_distance(a, b)
+
+    try:
+        raw = float(distance.weighted_feature_edit_distance(a, b))
+        normalized = raw / _max_panphon_substitution_distance()
+        return max(0.0, min(1.0, normalized))
+    except Exception:
         return 1.0
 
-    va = np.array(PHONEME_VECTORS[a], dtype=float)
-    vb = np.array(PHONEME_VECTORS[b], dtype=float)
 
-    return float(np.linalg.norm(va - vb) / np.sqrt(len(va)))
+def substitution_label(distance_value: float) -> str:
+    """Map a normalized distance to an interpretable substitution label."""
+    if distance_value <= 0.30:
+        return "minor_substitution"
+    if distance_value <= 0.60:
+        return "medium_substitution"
+    return "major_substitution"

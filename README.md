@@ -1,36 +1,27 @@
-# Pronunciation Feedback Web App — G2P Integrated
+# Pronunciation Feedback System — Final Local Version
 
-This is a local Flask web app for your graduation project pipeline:
+This is the final local Flask version of the pronunciation feedback project.
 
-```text
-User text  -> bundled G2P -> expected IPA phonemes
-User audio -> trained Wav2Vec2 -> spoken IPA phonemes
-Expected + spoken phonemes -> DP alignment -> pronunciation feedback
-```
-
-## What is integrated now?
-
-This version already includes your `g2p_pipeline_split_v2` folder.
-
-The backend uses:
+## Pipeline
 
 ```text
-g2p_pipeline_split_v2/contextual_g2p.py
-g2p_pipeline_split_v2/heteronyms.json
-g2p_pipeline_split_v2/cmudict-0.7b-ipa.txt
+User text  -> G2P -> expected IPA phonemes
+User audio -> Wav2Vec2 -> spoken IPA phonemes
+Expected + spoken phonemes -> vector-weighted DP alignment -> feedback + weighted PER
+Expected phonemes -> IPA reader guide
 ```
 
-The G2P output is converted to this format:
+## Included features
 
-```text
-s k uː l | ɪ z | oʊ p ə n
-```
-
-That means:
-
-- spaces separate phonemes
-- `|` separates words
-- the DP alignment compares phoneme tokens
+- Text-to-IPA G2P using the bundled `g2p_pipeline_split_v2` folder.
+- Local Wav2Vec2 phoneme model loading.
+- Browser microphone recording.
+- Noise reduction before Wav2Vec2 inference.
+- Research-based phoneme distance using PanPhon articulatory feature edit distance.
+- Weighted dynamic programming alignment.
+- Minor / medium / major substitution labels.
+- Weighted PER calculation from phoneme distances.
+- IPA reader guide: explains how to read each expected phoneme.
 
 ## 1. Put your trained Wav2Vec2 model here
 
@@ -40,7 +31,7 @@ After unzipping this project, copy your downloaded trained model files into:
 model/my_wav2vec2_phoneme_model/
 ```
 
-That folder should contain files like:
+The folder should contain files such as:
 
 ```text
 config.json
@@ -56,75 +47,87 @@ or:
 pytorch_model.bin
 ```
 
-## 2. Install dependencies
+## 2. Recommended environment
 
-### Recommended full install
+Using Conda on Windows:
 
-This tries to use your context-aware G2P with spaCy + NeMo:
+```bash
+conda create -n pronunciation-app python=3.10 -y
+conda activate pronunciation-app
+```
+
+## 3. Install dependencies
+
+Minimal demo install:
+
+```bash
+pip install -r requirements-minimal.txt
+```
+
+Full install with NeMo/spaCy context-aware G2P:
 
 ```bash
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-### Easier minimal install
+If NeMo is hard to install on Windows, use `requirements-minimal.txt`. The app will still use the bundled IPA dictionary fallback.
 
-If NeMo is hard to install, use this:
+## 4. Install FFmpeg
+
+Browser audio is recorded as `.webm`. The app tries to convert it to 16 kHz mono WAV using FFmpeg.
+
+- Windows: install FFmpeg and add it to PATH.
+- macOS: `brew install ffmpeg`
+- Linux: `sudo apt install ffmpeg`
+
+Check:
 
 ```bash
-pip install -r requirements-minimal.txt
+ffmpeg -version
 ```
 
-The app will still work using the bundled IPA dictionary fallback.
-The fallback is less context-aware, but it is good enough to run the demo.
-
-## 3. Test G2P only
-
-Before running the whole web app, test the text-to-phoneme part:
+## 5. Test G2P only
 
 ```bash
 python test_g2p.py
 ```
 
-Expected example style:
-
-```text
-TEXT: school is open
-IPA : s k uː l | ɪ z | oʊ p ə n
-```
-
-## 4. Run the app
+## 6. Run the app
 
 ```bash
 python app.py
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-## 5. Optional: test G2P from the browser/backend
+## 7. Weighted PER formula
 
-After running `python app.py`, you can test the G2P endpoint using curl:
+This version computes weighted PER as:
 
-```bash
-curl -X POST http://127.0.0.1:5000/g2p \
-  -H "Content-Type: application/json" \
-  -d '{"text":"school is open"}'
+```text
+Weighted PER = sum(error costs) / number of reference phonemes × 100
 ```
 
-## 6. If browser audio fails
+Where:
 
-Browser recordings are usually saved as `.webm`. `librosa` can load this if FFmpeg is installed.
+- correct phoneme = 0
+- substitution = normalized PanPhon phoneme distance
+- deletion = 1
+- insertion = 1
 
-If audio loading fails, install FFmpeg:
+This means close substitutions, such as similar vowels or similar consonants, receive less penalty than very different substitutions.
 
-- Windows: install FFmpeg and add it to PATH
-- macOS: `brew install ffmpeg`
-- Linux: `sudo apt install ffmpeg`
+## 8. Research note for the report
 
-## Notes
+The vectorized distance is based on PanPhon articulatory feature vectors:
 
-This app runs locally on your computer. It does not upload audio to any online server unless you modify it.
+> Mortensen, D. R., Littell, P., Bharadwaj, A., Goyal, K., Dyer, C., & Levin, L. (2016). PanPhon: A Resource for Mapping IPA Segments to Articulatory Feature Vectors. COLING 2016.
+
+## 9. Local-only note
+
+This app runs locally on your computer. It does not upload audio to an online server unless you modify it.

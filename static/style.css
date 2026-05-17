@@ -220,3 +220,62 @@ th {
     color: #7e22ce;
     font-weight: 800;
 }
+
+
+.secondary-button {
+    background: #e0e7ff;
+    color: #1d3557;
+}
+
+.secondary-button:hover:not(:disabled) {
+    background: #c7d2fe;
+}
+
+.guide-box {
+    margin-top: 18px;
+    padding: 22px;
+}
+
+.guide-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.guide-subtitle {
+    color: #64748b;
+    margin-top: 6px;
+    margin-bottom: 0;
+    line-height: 1.5;
+}
+
+#readingGuide {
+    margin-top: 18px;
+}
+
+.guide-word {
+    margin-bottom: 24px;
+}
+
+.guide-word h4 {
+    color: #1d3557;
+    margin: 0 0 8px;
+}
+
+#readingGuide table {
+    margin-bottom: 16px;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    overflow: hidden;
+}
+
+#readingGuide td strong {
+    font-size: 20px;
+    color: #1d3557;
+}
+
+.empty-guide {
+    color: #64748b;
+}

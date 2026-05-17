@@ -7,9 +7,89 @@ const stopBtn = document.getElementById("stopBtn");
 const analyzeBtn = document.getElementById("analyzeBtn");
 const audioPlayback = document.getElementById("audioPlayback");
 const statusText = document.getElementById("statusText");
+const toggleGuideBtn = document.getElementById("toggleGuideBtn");
+const readTextBtn = document.getElementById("readTextBtn");
+const stopReadBtn = document.getElementById("stopReadBtn");
+
+const hasSpeechSynthesis = "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+let availableVoices = [];
+let activeUtterance = null;
+
+if (hasSpeechSynthesis) {
+    loadVoices();
+    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
+} else if (readTextBtn && stopReadBtn) {
+    readTextBtn.disabled = true;
+    stopReadBtn.disabled = true;
+    readTextBtn.title = "Text reader is not supported in this browser.";
+}
+
+if (toggleGuideBtn) {
+    toggleGuideBtn.onclick = () => {
+        const guide = document.getElementById("readingGuide");
+        const hidden = guide.classList.toggle("hidden");
+        toggleGuideBtn.textContent = hidden ? "Show Reader" : "Hide Reader";
+    };
+}
+
+if (readTextBtn) {
+    readTextBtn.onclick = () => {
+        if (!hasSpeechSynthesis) {
+            alert("Text reader is not supported in this browser.");
+            return;
+        }
+
+        const text = document.getElementById("textInput").value.trim();
+        if (!text) {
+            alert("Please enter text first.");
+            return;
+        }
+
+        stopTextReader(true);
+
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.voice = getPreferredVoice();
+        utterance.rate = 0.92;
+        utterance.pitch = 1;
+        activeUtterance = utterance;
+
+        utterance.onstart = () => {
+            readTextBtn.disabled = true;
+            stopReadBtn.disabled = false;
+            statusText.textContent = "Reading text aloud...";
+        };
+
+        utterance.onend = () => {
+            if (activeUtterance === utterance) {
+                activeUtterance = null;
+                readTextBtn.disabled = false;
+                stopReadBtn.disabled = true;
+                statusText.textContent = "Reader finished.";
+            }
+        };
+
+        utterance.onerror = () => {
+            if (activeUtterance === utterance) {
+                activeUtterance = null;
+                readTextBtn.disabled = false;
+                stopReadBtn.disabled = true;
+                statusText.textContent = "Reader failed.";
+            }
+        };
+
+        window.speechSynthesis.speak(utterance);
+    };
+}
+
+if (stopReadBtn) {
+    stopReadBtn.onclick = () => {
+        stopTextReader();
+    };
+}
 
 startBtn.onclick = async () => {
     try {
+        stopTextReader(true);
         audioChunks = [];
         recordedBlob = null;
 
@@ -108,6 +188,13 @@ function showResults(data) {
     document.getElementById("insCount").textContent = data.metrics.insertions;
     document.getElementById("perValue").textContent = data.metrics.phoneme_error_rate + "%";
 
+    showReadingGuide(data.reference_guide || []);
+    const guide = document.getElementById("readingGuide");
+    if (guide && toggleGuideBtn) {
+        guide.classList.add("hidden");
+        toggleGuideBtn.textContent = "Show Reader";
+    }
+
     const table = document.getElementById("alignmentTable");
     table.innerHTML = "";
 
@@ -118,6 +205,7 @@ function showResults(data) {
             <td>${escapeHtml(row.expected)}</td>
             <td>${escapeHtml(row.spoken)}</td>
             <td class="${row.result}">${escapeHtml(row.result)}</td>
+            <td>${row.distance !== undefined ? escapeHtml(row.distance) : "—"}</td>
         `;
 
         table.appendChild(tr);
@@ -131,4 +219,81 @@ function escapeHtml(value) {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+}
+
+
+function showReadingGuide(guide) {
+    const container = document.getElementById("readingGuide");
+    if (!container) return;
+
+    container.innerHTML = "";
+
+    if (!guide.length) {
+        container.innerHTML = `<p class="empty-guide">No phoneme guide available.</p>`;
+        return;
+    }
+
+    guide.forEach(word => {
+        const wordDiv = document.createElement("div");
+        wordDiv.className = "guide-word";
+
+        const title = document.createElement("h4");
+        title.textContent = "Word " + word.word_index;
+        wordDiv.appendChild(title);
+
+        const table = document.createElement("table");
+        table.innerHTML = `
+            <thead>
+                <tr>
+                    <th>Phoneme</th>
+                    <th>How to read it</th>
+                    <th>Example</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        `;
+
+        const tbody = table.querySelector("tbody");
+        word.phonemes.forEach(ph => {
+            const row = document.createElement("tr");
+            row.innerHTML = `
+                <td><strong>${escapeHtml(ph.symbol)}</strong></td>
+                <td>${escapeHtml(ph.description)}</td>
+                <td>${escapeHtml(ph.example)}</td>
+            `;
+            tbody.appendChild(row);
+        });
+
+        wordDiv.appendChild(table);
+        container.appendChild(wordDiv);
+    });
+}
+
+function loadVoices() {
+    availableVoices = window.speechSynthesis.getVoices();
+}
+
+function getPreferredVoice() {
+    if (!availableVoices.length) return null;
+
+    const preferred = availableVoices.find(voice =>
+        voice.lang && voice.lang.toLowerCase().startsWith("en")
+    );
+
+    return preferred || availableVoices[0];
+}
+
+function stopTextReader(silent = false) {
+    if (!hasSpeechSynthesis) return;
+
+    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+        window.speechSynthesis.cancel();
+    }
+
+    activeUtterance = null;
+    if (readTextBtn) readTextBtn.disabled = false;
+    if (stopReadBtn) stopReadBtn.disabled = true;
+    if (!silent) {
+        statusText.textContent = "Reader stopped.";
+    }
 }

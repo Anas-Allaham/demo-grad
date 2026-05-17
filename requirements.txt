@@ -4,5 +4,7 @@ torch
 librosa
 soundfile
 numpy
+noisereduce
+panphon
 spacy
 nemo_toolkit[tts]

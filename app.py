@@ -3,12 +3,21 @@ import re
 import sys
 import uuid
 import unicodedata
+import subprocess
+import shutil
 from pathlib import Path
 from typing import Dict, List
-import noisereduce as nr
-import soundfile as sf
+try:
+    import noisereduce as nr
+except Exception:
+    nr = None
 
-from phoneme_vectors import canonicalize_phoneme, phoneme_distance
+try:
+    import soundfile as sf
+except Exception:
+    sf = None
+
+from phoneme_vectors import canonicalize_phoneme, phoneme_distance, substitution_label, panphon_available
 import librosa
 import torch
 from flask import Flask, jsonify, render_template, request
@@ -217,6 +226,104 @@ def ipa_to_tokens(ipa: str) -> List[str]:
     return [canon for canon in (canonicalize_phoneme(tok) for tok in tokens) if canon]
 
 
+
+# -----------------------------
+# IPA reading guide
+# -----------------------------
+PHONEME_GUIDE = {
+    "i": {"example": "see", "description": "long ee sound, like 'see'"},
+    "iː": {"example": "see", "description": "long ee sound, like 'see'"},
+    "ɪ": {"example": "sit", "description": "short i sound, like 'sit'"},
+    "eɪ": {"example": "say", "description": "like 'ay' in 'say'"},
+    "ɛ": {"example": "bed", "description": "short e sound, like 'bed'"},
+    "æ": {"example": "cat", "description": "a sound like 'cat'"},
+    "ɑ": {"example": "father", "description": "open ah sound, like 'father'"},
+    "ɔ": {"example": "thought", "description": "aw sound, like 'thought'"},
+    "ʊ": {"example": "foot", "description": "short oo sound, like 'foot'"},
+    "u": {"example": "food", "description": "oo sound, like 'food'"},
+    "uː": {"example": "food", "description": "long oo sound, like 'food'"},
+    "ʌ": {"example": "cup", "description": "uh sound, like 'cup'"},
+    "ə": {"example": "about", "description": "schwa: weak 'uh' sound"},
+    "ɝ": {"example": "bird", "description": "r-colored vowel, like 'bird'"},
+    "aɪ": {"example": "my", "description": "like 'eye', as in 'my'"},
+    "aʊ": {"example": "now", "description": "like 'ow', as in 'now'"},
+    "oʊ": {"example": "go", "description": "like 'oh', as in 'go'"},
+    "ɔɪ": {"example": "boy", "description": "like 'oy', as in 'boy'"},
+    "p": {"example": "pen", "description": "voiceless p sound"},
+    "b": {"example": "boy", "description": "voiced b sound"},
+    "t": {"example": "top", "description": "voiceless t sound"},
+    "d": {"example": "dog", "description": "voiced d sound"},
+    "k": {"example": "cat", "description": "voiceless k sound"},
+    "g": {"example": "go", "description": "voiced g sound"},
+    "ɡ": {"example": "go", "description": "voiced g sound"},
+    "f": {"example": "fish", "description": "voiceless f sound"},
+    "v": {"example": "van", "description": "voiced v sound"},
+    "θ": {"example": "think", "description": "voiceless th sound, like 'think'"},
+    "ð": {"example": "this", "description": "voiced th sound, like 'this'"},
+    "s": {"example": "see", "description": "s sound"},
+    "z": {"example": "zoo", "description": "z sound"},
+    "ʃ": {"example": "she", "description": "sh sound"},
+    "ʒ": {"example": "measure", "description": "zh sound, like 'measure'"},
+    "h": {"example": "hat", "description": "h sound"},
+    "tʃ": {"example": "chair", "description": "ch sound"},
+    "dʒ": {"example": "jump", "description": "j sound"},
+    "m": {"example": "man", "description": "m sound"},
+    "n": {"example": "no", "description": "n sound"},
+    "ŋ": {"example": "sing", "description": "ng sound, like the end of 'sing'"},
+    "l": {"example": "love", "description": "l sound"},
+    "ɹ": {"example": "red", "description": "English r sound"},
+    "r": {"example": "red", "description": "English r sound"},
+    "w": {"example": "we", "description": "w sound"},
+    "j": {"example": "yes", "description": "y sound, like 'yes'"},
+}
+
+
+def ipa_reading_guide(ipa: str):
+    """Return a word-by-word reading guide for an IPA sequence."""
+    ipa = normalize_ipa(ipa)
+    words = [w.strip() for w in ipa.split("|") if w.strip()]
+    guide = []
+
+    for word_index, word in enumerate(words, start=1):
+        tokens = word.split() if " " in word else split_ipa_word(word)
+        phonemes = []
+        for token in tokens:
+            token = canonicalize_phoneme(token)
+            info = PHONEME_GUIDE.get(token, {
+                "example": "unknown",
+                "description": "No guide available for this phoneme yet.",
+            })
+            phonemes.append({
+                "symbol": token,
+                "example": info["example"],
+                "description": info["description"],
+            })
+        guide.append({"word_index": word_index, "phonemes": phonemes})
+
+    return guide
+
+
+def convert_audio_to_wav(input_path: Path) -> Path:
+    """Convert browser audio to 16kHz mono WAV when FFmpeg is available."""
+    input_path = Path(input_path)
+    output_path = input_path.with_name(input_path.stem + "_converted.wav")
+
+    if output_path.exists():
+        return output_path
+
+    if shutil.which("ffmpeg") is None:
+        return input_path
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-ac", "1",
+        "-ar", "16000",
+        str(output_path),
+    ]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return output_path
+
 # -----------------------------
 # Audio to Phonemes using Wav2Vec2
 # -----------------------------
@@ -245,22 +352,28 @@ def ipa_to_tokens(ipa: str) -> List[str]:
 def transcribe_audio_to_phonemes(audio_path: Path) -> str:
     load_wav2vec_model()
 
+    wav_or_original_path = convert_audio_to_wav(audio_path)
+
     audio_array, sr = librosa.load(
-        str(audio_path),
+        str(wav_or_original_path),
         sr=16000,
         mono=True
     )
 
-    reduced_noise = nr.reduce_noise(
-        y=audio_array,
-        sr=sr
-    )
+    if nr is not None:
+        model_audio = nr.reduce_noise(
+            y=audio_array,
+            sr=sr
+        )
+    else:
+        model_audio = audio_array
 
-    clean_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
-    sf.write(str(clean_path), reduced_noise, sr)
+    if sf is not None:
+        clean_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
+        sf.write(str(clean_path), model_audio, sr)
 
     inputs = processor(
-        reduced_noise,
+        model_audio,
         sampling_rate=16000,
         return_tensors="pt",
         padding=True,
@@ -411,14 +524,10 @@ def align_phonemes(ref_seq, hyp_seq):
             aligned_hyp.append(hyp_ph)
             distances.append(round(dist, 3))
 
-            if dist == 0:
+            if ref_ph == hyp_ph:
                 operations.append("correct")
-            elif dist <= 0.25:
-                operations.append("minor_substitution")
-            elif dist <= 0.50:
-                operations.append("medium_substitution")
             else:
-                operations.append("major_substitution")
+                operations.append(substitution_label(dist))
 
             i -= 1
             j -= 1
@@ -466,7 +575,7 @@ def align_phonemes(ref_seq, hyp_seq):
 #     }
 
 
-def calculate_metrics(operations: List[str]):
+def calculate_metrics(operations: List[str], distances: List[float] | None = None):
     total_reference_units = len([op for op in operations if op != "insertion"])
 
     minor = operations.count("minor_substitution")
@@ -478,14 +587,22 @@ def calculate_metrics(operations: List[str]):
     insertions = operations.count("insertion")
     correct = operations.count("correct")
 
-    # Weighted phoneme error rate
-    weighted_error = (
-        minor * 0.33 +
-        medium * 0.66 +
-        major * 1.0 +
-        deletions * 1.0 +
-        insertions * 1.0
-    )
+    if distances and len(distances) == len(operations):
+        # Research-based weighted PER: sum the actual normalized phoneme distances.
+        # Correct = 0, insertion/deletion = 1, substitution = PanPhon normalized distance.
+        weighted_error = sum(
+            dist for op, dist in zip(operations, distances)
+            if op != "correct"
+        )
+    else:
+        # Fallback if distances are unavailable.
+        weighted_error = (
+            minor * 0.33 +
+            medium * 0.66 +
+            major * 1.0 +
+            deletions * 1.0 +
+            insertions * 1.0
+        )
 
     if total_reference_units > 0:
         per = min(100, (weighted_error / total_reference_units) * 100)
@@ -500,6 +617,7 @@ def calculate_metrics(operations: List[str]):
         "major_substitutions": major,
         "deletions": deletions,
         "insertions": insertions,
+        "weighted_error": round(weighted_error, 3),
         "phoneme_error_rate": round(per, 2),
     }
 
@@ -523,6 +641,7 @@ def health():
         "g2p_ready": g2p_ready,
         "g2p_mode": g2p_mode,
         "g2p_path": str(G2P_DIR),
+        "panphon_available": panphon_available(),
     })
 
 
@@ -534,7 +653,7 @@ def g2p_route():
         if not text:
             return jsonify({"error": "Please send text."}), 400
         ipa = g2p_convert(text)
-        return jsonify({"text": text, "ipa": ipa, "g2p_mode": g2p_mode})
+        return jsonify({"text": text, "ipa": ipa, "guide": ipa_reading_guide(ipa), "g2p_mode": g2p_mode})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -562,7 +681,7 @@ def analyze():
         hyp_seq = ipa_to_tokens(predicted_ipa)
 
         aligned_ref, aligned_hyp, operations, distances = align_phonemes(ref_seq, hyp_seq)
-        metrics = calculate_metrics(operations)
+        metrics = calculate_metrics(operations, distances)
 
         alignment = []
         for ref, hyp, op, dist in zip(aligned_ref, aligned_hyp, operations, distances):
@@ -577,7 +696,10 @@ def analyze():
             "text": user_text,
             "reference_ipa": reference_ipa,
             "predicted_ipa": predicted_ipa,
+            "reference_guide": ipa_reading_guide(reference_ipa),
+            "predicted_guide": ipa_reading_guide(predicted_ipa),
             "g2p_mode": g2p_mode,
+            "vectorizer": "panphon" if panphon_available() else "fallback_features",
             "alignment": alignment,
             "metrics": metrics,
         })
