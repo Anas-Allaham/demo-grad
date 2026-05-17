@@ -6,6 +6,9 @@ const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const analyzeBtn = document.getElementById("analyzeBtn");
 const audioPlayback = document.getElementById("audioPlayback");
+const reducedAudioPlayback = document.getElementById("reducedAudioPlayback");
+const reducedAudioSection = document.getElementById("reducedAudioSection");
+const reducedAudioLabel = document.getElementById("reducedAudioLabel");
 const statusText = document.getElementById("statusText");
 const toggleGuideBtn = document.getElementById("toggleGuideBtn");
 const readTextBtn = document.getElementById("readTextBtn");
@@ -92,9 +95,34 @@ startBtn.onclick = async () => {
         stopTextReader(true);
         audioChunks = [];
         recordedBlob = null;
+        if (reducedAudioPlayback && reducedAudioSection) {
+            reducedAudioPlayback.removeAttribute("src");
+            reducedAudioPlayback.load();
+            reducedAudioSection.classList.add("hidden");
+        }
 
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+            },
+            video: false,
+        });
+
+        const track = stream.getAudioTracks()[0];
+        if (track) {
+            console.log("Actual microphone settings:", track.getSettings());
+        }
+
+        const preferredMimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+            ? "audio/webm;codecs=opus"
+            : "";
+
+        mediaRecorder = preferredMimeType
+            ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+            : new MediaRecorder(stream);
 
         mediaRecorder.ondataavailable = event => {
             if (event.data.size > 0) {
@@ -102,8 +130,13 @@ startBtn.onclick = async () => {
             }
         };
 
+        mediaRecorder.onerror = event => {
+            console.error("MediaRecorder error:", event.error || event);
+        };
+
         mediaRecorder.onstop = () => {
-            recordedBlob = new Blob(audioChunks, { type: "audio/webm" });
+            const blobType = mediaRecorder.mimeType || "audio/webm";
+            recordedBlob = new Blob(audioChunks, { type: blobType });
             const audioUrl = URL.createObjectURL(recordedBlob);
             audioPlayback.src = audioUrl;
             analyzeBtn.disabled = false;
@@ -124,6 +157,9 @@ startBtn.onclick = async () => {
 
 stopBtn.onclick = () => {
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        if (mediaRecorder.state === "recording") {
+            mediaRecorder.requestData();
+        }
         mediaRecorder.stop();
     }
 
@@ -146,7 +182,7 @@ analyzeBtn.onclick = async () => {
 
     const formData = new FormData();
     formData.append("text", text);
-    formData.append("audio", recordedBlob, "recording.webm");
+    formData.append("audio", recordedBlob, "raw_browser_recording.webm");
 
     document.getElementById("loading").classList.remove("hidden");
     document.getElementById("results").classList.add("hidden");
@@ -168,7 +204,21 @@ analyzeBtn.onclick = async () => {
         }
 
         showResults(data);
-        statusText.textContent = "Analysis complete.";
+        let statusMessage = "Analysis complete.";
+        if (data.reduced_audio_url && data.noise_reduction_applied) {
+            statusMessage = "Analysis complete. You can now play the noise-reduced audio.";
+        } else if (data.reduced_audio_url) {
+            statusMessage = "Analysis complete. You can now play the processed audio.";
+        } else if (!data.noise_reduction_applied) {
+            statusMessage = "Analysis complete. Noise reduction package is not installed, so denoised playback is unavailable.";
+        }
+
+        const quality = data.audio_quality_check;
+        if (quality && quality.possible_dropout) {
+            statusMessage += " Warning: possible dropouts were detected in the raw recording.";
+        }
+
+        statusText.textContent = statusMessage;
     } catch (error) {
         document.getElementById("loading").classList.add("hidden");
         alert("Request failed: " + error.message);
@@ -178,6 +228,19 @@ analyzeBtn.onclick = async () => {
 
 function showResults(data) {
     document.getElementById("results").classList.remove("hidden");
+    if (reducedAudioPlayback && reducedAudioSection) {
+        if (data.reduced_audio_url) {
+            reducedAudioPlayback.src = data.reduced_audio_url;
+            if (reducedAudioLabel) {
+                reducedAudioLabel.textContent = data.noise_reduction_applied ? "Noise-Reduced Playback" : "Processed Playback";
+            }
+            reducedAudioSection.classList.remove("hidden");
+        } else {
+            reducedAudioPlayback.removeAttribute("src");
+            reducedAudioPlayback.load();
+            reducedAudioSection.classList.add("hidden");
+        }
+    }
 
     document.getElementById("referenceIpa").textContent = data.reference_ipa;
     document.getElementById("predictedIpa").textContent = data.predicted_ipa;
@@ -210,6 +273,7 @@ function showResults(data) {
 
         table.appendChild(tr);
     });
+
 }
 
 function escapeHtml(value) {

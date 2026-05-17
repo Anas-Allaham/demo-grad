@@ -111,6 +111,10 @@ audio {
     margin-top: 10px;
 }
 
+#reducedAudioSection {
+    margin-top: 14px;
+}
+
 .status {
     color: #64748b;
     margin-bottom: 0;

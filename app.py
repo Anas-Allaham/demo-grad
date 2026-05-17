@@ -6,7 +6,7 @@ import unicodedata
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 try:
     import noisereduce as nr
 except Exception:
@@ -20,7 +20,7 @@ except Exception:
 from phoneme_vectors import canonicalize_phoneme, phoneme_distance, substitution_label, panphon_available
 import librosa
 import torch
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_from_directory
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 app = Flask(__name__)
@@ -31,8 +31,26 @@ MODEL_PATH = BASE_DIR / "model" / "my_wav2vec2_phoneme_model"
 G2P_DIR = BASE_DIR / "g2p_pipeline_split_v2"
 HETERONYMS_PATH = G2P_DIR / "heteronyms.json"
 IPA_DICT_PATH = G2P_DIR / "cmudict-0.7b-ipa.txt"
+VOICE_FILTERING_DIR = BASE_DIR / "voice-filtering"
 
 UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+if str(VOICE_FILTERING_DIR) not in sys.path:
+    sys.path.insert(0, str(VOICE_FILTERING_DIR))
+
+try:
+    from audio_filter_safe import process_audio_file as safe_process_audio_file
+except Exception as exc:
+    safe_process_audio_file = None
+    print("audio_filter_safe is unavailable. Falling back to legacy preprocessing.")
+    print("Reason:", repr(exc))
+
+try:
+    from audio_quality_check import analyze_audio as run_audio_quality_check
+except Exception as exc:
+    run_audio_quality_check = None
+    print("audio_quality_check is unavailable. Skipping dropout checks.")
+    print("Reason:", repr(exc))
 
 processor = None
 model = None
@@ -324,6 +342,31 @@ def convert_audio_to_wav(input_path: Path) -> Path:
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_path
 
+
+def summarize_quality_report(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if report is None:
+        return None
+
+    if "error" in report:
+        return {
+            "error": str(report["error"]),
+        }
+
+    near_silent = report.get("near_silent_regions_over_30ms", []) or []
+    exact_zero = report.get("exact_zero_regions_over_10ms", []) or []
+
+    return {
+        "duration_seconds": report.get("duration_seconds"),
+        "overall_rms": report.get("overall_rms"),
+        "peak_amplitude": report.get("peak_amplitude"),
+        "near_silent_region_count": len(near_silent),
+        "exact_zero_region_count": len(exact_zero),
+        "possible_dropout": bool(near_silent or exact_zero),
+        "near_silent_regions_preview": near_silent[:5],
+        "exact_zero_regions_preview": exact_zero[:5],
+    }
+
+
 # -----------------------------
 # Audio to Phonemes using Wav2Vec2
 # -----------------------------
@@ -349,28 +392,69 @@ def convert_audio_to_wav(input_path: Path) -> Path:
 
 #     return normalize_ipa(predicted_ipa)
 
-def transcribe_audio_to_phonemes(audio_path: Path) -> str:
+def transcribe_audio_to_phonemes(audio_path: Path):
     load_wav2vec_model()
 
     wav_or_original_path = convert_audio_to_wav(audio_path)
+    reduced_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
 
-    audio_array, sr = librosa.load(
-        str(wav_or_original_path),
-        sr=16000,
-        mono=True
-    )
+    quality_report = None
+    if run_audio_quality_check is not None:
+        try:
+            quality_report = run_audio_quality_check(str(wav_or_original_path), save_plots=False)
+        except Exception as exc:
+            quality_report = {"error": str(exc)}
 
-    if nr is not None:
-        model_audio = nr.reduce_noise(
-            y=audio_array,
-            sr=sr
+    model_input_path: Optional[Path] = wav_or_original_path
+    noise_reduction_applied = False
+    preprocessing_pipeline = "raw_audio_fallback"
+
+    if safe_process_audio_file is not None:
+        try:
+            safe_process_audio_file(
+                input_path=wav_or_original_path,
+                output_path=reduced_path,
+                use_noise_reduce=True,
+            )
+            if reduced_path.exists():
+                model_input_path = reduced_path
+                noise_reduction_applied = nr is not None
+                preprocessing_pipeline = "audio_filter_safe" if nr is not None else "audio_filter_safe_without_noisereduce"
+        except Exception as exc:
+            print("audio_filter_safe failed. Falling back to legacy noisereduce.")
+            print("Reason:", repr(exc))
+
+    if model_input_path == wav_or_original_path:
+        audio_array, sr = librosa.load(
+            str(wav_or_original_path),
+            sr=16000,
+            mono=True
         )
-    else:
-        model_audio = audio_array
 
-    if sf is not None:
-        clean_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
-        sf.write(str(clean_path), model_audio, sr)
+        if nr is not None:
+            model_audio = nr.reduce_noise(
+                y=audio_array,
+                sr=sr
+            )
+            noise_reduction_applied = True
+            preprocessing_pipeline = "legacy_noisereduce"
+        else:
+            model_audio = audio_array
+            preprocessing_pipeline = "raw_audio_fallback"
+
+        if sf is not None:
+            sf.write(str(reduced_path), model_audio, sr)
+            if reduced_path.exists():
+                model_input_path = reduced_path
+        else:
+            model_input_path = None
+
+    if model_input_path is not None:
+        model_audio, _ = librosa.load(
+            str(model_input_path),
+            sr=16000,
+            mono=True
+        )
 
     inputs = processor(
         model_audio,
@@ -387,7 +471,13 @@ def transcribe_audio_to_phonemes(audio_path: Path) -> str:
     predicted_ids = torch.argmax(logits, dim=-1)
     predicted_ipa = processor.batch_decode(predicted_ids)[0]
 
-    return normalize_ipa(predicted_ipa)
+    return (
+        normalize_ipa(predicted_ipa),
+        (reduced_path if reduced_path.exists() else None),
+        noise_reduction_applied,
+        preprocessing_pipeline,
+        summarize_quality_report(quality_report),
+    )
 
 # -----------------------------
 # Dynamic Programming Alignment
@@ -642,7 +732,14 @@ def health():
         "g2p_mode": g2p_mode,
         "g2p_path": str(G2P_DIR),
         "panphon_available": panphon_available(),
+        "audio_filter_safe_available": safe_process_audio_file is not None,
+        "audio_quality_check_available": run_audio_quality_check is not None,
     })
+
+
+@app.route("/uploads/<path:filename>")
+def uploaded_audio(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
 
 @app.route("/g2p", methods=["POST"])
@@ -670,12 +767,21 @@ def analyze():
             return jsonify({"error": "No audio file received."}), 400
 
         audio_file = request.files["audio"]
-        filename = f"{uuid.uuid4()}.webm"
+        mimetype = (audio_file.mimetype or "").lower()
+        extension = ".ogg" if "ogg" in mimetype else ".webm"
+        filename = f"{uuid.uuid4()}{extension}"
         audio_path = UPLOAD_FOLDER / filename
         audio_file.save(str(audio_path))
 
         reference_ipa = g2p_convert(user_text)
-        predicted_ipa = transcribe_audio_to_phonemes(audio_path)
+        (
+            predicted_ipa,
+            reduced_audio_path,
+            noise_reduction_applied,
+            preprocessing_pipeline,
+            quality_report,
+        ) = transcribe_audio_to_phonemes(audio_path)
+        reduced_audio_url = f"/uploads/{reduced_audio_path.name}" if reduced_audio_path else None
 
         ref_seq = ipa_to_tokens(reference_ipa)
         hyp_seq = ipa_to_tokens(predicted_ipa)
@@ -700,6 +806,10 @@ def analyze():
             "predicted_guide": ipa_reading_guide(predicted_ipa),
             "g2p_mode": g2p_mode,
             "vectorizer": "panphon" if panphon_available() else "fallback_features",
+            "noise_reduction_applied": noise_reduction_applied,
+            "preprocessing_pipeline": preprocessing_pipeline,
+            "audio_quality_check": quality_report,
+            "reduced_audio_url": reduced_audio_url,
             "alignment": alignment,
             "metrics": metrics,
         })

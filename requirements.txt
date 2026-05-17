@@ -8,3 +8,4 @@ noisereduce
 panphon
 spacy
 nemo_toolkit[tts]
+matplotlib
