@@ -17,7 +17,7 @@ try:
 except Exception:
     sf = None
 
-from phoneme_vectors import canonicalize_phoneme, phoneme_distance, panphon_available
+from phoneme_vectors_professional import canonicalize_phoneme, phoneme_distance, panphon_available
 import librosa
 import torch
 from flask import Flask, jsonify, render_template, request, send_from_directory
@@ -601,7 +601,10 @@ def substitution_cost_and_label(ref_ph: str, hyp_ph: str):
     if _is_vowel(ref_ph) != _is_vowel(hyp_ph):
         return VOWEL_CONSONANT_SUB_COST, "vowel_consonant_substitution"
 
-    distance_value = phoneme_distance(ref_ph, hyp_ph)
+    try:
+        distance_value = phoneme_distance(ref_ph, hyp_ph)
+    except Exception:
+        return UNKNOWN_SUB_COST, "unknown_substitution"
 
     if distance_value <= 0.15:
         return VERY_CLOSE_SUB_COST, "very_close_substitution"
