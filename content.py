@@ -20,6 +20,8 @@ import re
 from collections import Counter
 from typing import Callable, Dict, Iterable, List, Optional
 
+from phoneme_vectors_professional import canonicalize_phoneme, validate_g2p_inventory
+
 # Exercise generation talks to an LLM through an OpenAI-compatible endpoint,
 # via the `openai` client library. Defaults target Google AI Studio (Gemini),
 # but everything is env-configurable so the same code works against any
@@ -65,7 +67,46 @@ COVERAGE_MIN_FRACTION = 0.6
 OVERMASTERED_MAX_FRACTION = 0.5
 GENERATION_MAX_ATTEMPTS = 5
 
+# Minimum times a target phoneme should appear in an accepted exercise so the
+# learner actually gets repetitions of it.
+MIN_TARGET_REPETITIONS = int(os.environ.get("EXERCISE_MIN_TARGET_REPS", "2"))
+
+# Candidate-scoring weights (documented, not magic numbers).
+TARGET_OCCURRENCE_CAP = 3          # cap per-phoneme reps so we don't reward tongue-twisters
+W_TARGET_OCCURRENCE = 1.0          # weight on capped target-phoneme occurrences
+W_TARGET_COVERAGE = 1.5            # weight on number of distinct targets covered
+W_UNDER_OBSERVED = 0.6            # weight on covering under-observed phonemes
+W_DIVERSITY = 0.4                 # weight on word/context diversity
+W_DIFFICULTY_FIT = 2.0            # penalty weight for difficulty mismatch
+W_OVERMASTERED = 0.05            # gentle: mastered sounds are useful scaffolding
+W_LENGTH = 0.04                  # gentle length preference
+W_EXCESS_LENGTH = 0.5            # extra penalty once past MAX_WORD_COUNT
+
+# Difficulty scale. level_proxy ~ word_count + avg_word_len/2; normalize it to
+# [0, 1]. This is a provisional readability proxy, NOT a validated CEFR band.
+LEVEL_PROXY_MIN = 6.0
+LEVEL_PROXY_MAX = 26.0
+
+# Target difficulty per assessed level (provisional).
+LEVEL_DIFFICULTY = {
+    "unknown": 0.4,
+    "beginner": 0.25,
+    "intermediate": 0.55,
+    "advanced": 0.8,
+}
+
 _client = None
+
+
+def normalize_difficulty(level_proxy: float) -> float:
+    """Map a raw level_proxy onto a [0, 1] difficulty scale (provisional)."""
+    span = max(LEVEL_PROXY_MAX - LEVEL_PROXY_MIN, 1e-6)
+    return max(0.0, min(1.0, (float(level_proxy) - LEVEL_PROXY_MIN) / span))
+
+
+def difficulty_for_level(overall_level: Optional[str]) -> float:
+    """Target difficulty for a learner level (provisional)."""
+    return LEVEL_DIFFICULTY.get(overall_level or "unknown", 0.4)
 
 
 def _has_oov_fallback_words(text: str, reference_ipa: str) -> bool:
@@ -137,12 +178,59 @@ def score_candidate(
     overmastered_phonemes: Iterable[str],
     word_count: int,
     target_word_count: int = TARGET_WORD_COUNT,
+    level_proxy: Optional[float] = None,
+    target_difficulty: Optional[float] = None,
+    under_observed_phonemes: Optional[Iterable[str]] = None,
 ) -> float:
+    """Score a candidate sentence for how well it fits the learner right now.
+
+    Considers (all documented above as weighted terms):
+      * target-phoneme OCCURRENCE counts, capped so a sentence isn't rewarded
+        for cramming one sound unnaturally;
+      * how many DISTINCT target phonemes it covers;
+      * coverage of under-observed phonemes (diagnostic value);
+      * word/context diversity;
+      * fit between the sentence difficulty (from level_proxy) and the
+        learner's level;
+      * a GENTLE length preference and an excess-length penalty.
+
+    Mastered phonemes are only gently penalized -- natural sentences need them
+    and they provide useful scaffolding.
+    """
+    target_phonemes = list(target_phonemes)
     overmastered_phonemes = set(overmastered_phonemes)
-    overlap = sum(1 for p in target_phonemes if p in phoneme_counts)
-    overmastered_penalty = sum(1 for p in phoneme_counts if p in overmastered_phonemes) * 0.15
-    length_penalty = abs(word_count - target_word_count) * 0.05
-    return overlap - overmastered_penalty - length_penalty
+    under_observed_phonemes = set(under_observed_phonemes or ())
+
+    # Target occurrences (capped) + distinct-target coverage.
+    occurrence_score = sum(
+        min(phoneme_counts.get(p, 0), TARGET_OCCURRENCE_CAP) for p in target_phonemes
+    )
+    coverage = sum(1 for p in target_phonemes if p in phoneme_counts)
+
+    under_observed_cover = sum(1 for p in under_observed_phonemes if p in phoneme_counts)
+
+    # Distinct phonemes as a cheap word/context-diversity proxy.
+    diversity = len(phoneme_counts)
+
+    # Difficulty fit: penalize distance between sentence difficulty and target.
+    difficulty_penalty = 0.0
+    if level_proxy is not None and target_difficulty is not None:
+        difficulty_penalty = abs(normalize_difficulty(level_proxy) - target_difficulty)
+
+    overmastered_penalty = sum(1 for p in phoneme_counts if p in overmastered_phonemes)
+    length_penalty = abs(word_count - target_word_count)
+    excess_length = max(0, word_count - MAX_WORD_COUNT)
+
+    return (
+        W_TARGET_OCCURRENCE * occurrence_score
+        + W_TARGET_COVERAGE * coverage
+        + W_UNDER_OBSERVED * under_observed_cover
+        + W_DIVERSITY * math.log1p(diversity)
+        - W_DIFFICULTY_FIT * difficulty_penalty
+        - W_OVERMASTERED * overmastered_penalty
+        - W_LENGTH * length_penalty
+        - W_EXCESS_LENGTH * excess_length
+    )
 
 
 def pick_next_sentence(
@@ -151,13 +239,15 @@ def pick_next_sentence(
     overmastered_phonemes: Optional[Iterable[str]] = None,
     recently_served_ids: Optional[Iterable[int]] = None,
     target_word_count: int = TARGET_WORD_COUNT,
+    target_difficulty: Optional[float] = None,
+    under_observed_phonemes: Optional[Iterable[str]] = None,
 ) -> Optional[Dict]:
-    """Best-scoring candidate covering at least one target phoneme, biased
-    away from ones served recently and from overloading already-mastered
-    sounds. Falls back to repeating a recent sentence rather than serving
-    nothing if every candidate was recently served."""
+    """Best-scoring candidate covering at least one target phoneme, biased away
+    from recently served sentences and toward a difficulty that fits the
+    learner. Falls back to a recent sentence rather than serving nothing."""
     overmastered_phonemes = set(overmastered_phonemes or ())
     recently_served_ids = set(recently_served_ids or ())
+    under_observed_phonemes = set(under_observed_phonemes or ())
 
     if not candidates:
         return None
@@ -166,7 +256,14 @@ def pick_next_sentence(
     return max(
         eligible,
         key=lambda c: score_candidate(
-            c["phoneme_counts"], target_phonemes, overmastered_phonemes, c["word_count"], target_word_count
+            c["phoneme_counts"],
+            target_phonemes,
+            overmastered_phonemes,
+            c["word_count"],
+            target_word_count,
+            level_proxy=c.get("level_proxy"),
+            target_difficulty=target_difficulty,
+            under_observed_phonemes=under_observed_phonemes,
         ),
     )
 
@@ -175,13 +272,32 @@ def pick_diagnostic_sentence(
     all_sentences: List[Dict],
     recently_served_ids: Optional[Iterable[int]] = None,
     target_word_count: int = TARGET_WORD_COUNT,
+    uncovered_phonemes: Optional[Iterable[str]] = None,
 ) -> Optional[Dict]:
-    """Cold-start choice: the broadest-coverage sentence (most distinct
-    phonemes) not recently served, used before any mastery data exists."""
+    """Diagnostic choice.
+
+    Without ``uncovered_phonemes`` this is the classic cold-start pick: the
+    broadest-coverage sentence not served recently. With ``uncovered_phonemes``
+    (the phonemes still lacking enough independent observations) it instead
+    maximizes NEW coverage -- the number of still-uncovered phonemes the
+    sentence would exercise -- so the diagnostic phase keeps probing sounds the
+    first sentence missed instead of re-drilling what it already saw.
+    """
     recently_served_ids = set(recently_served_ids or ())
     if not all_sentences:
         return None
     eligible = [s for s in all_sentences if s["id"] not in recently_served_ids] or all_sentences
+
+    uncovered = set(uncovered_phonemes or ())
+    if uncovered:
+        return max(
+            eligible,
+            key=lambda s: (
+                sum(1 for p in uncovered if p in s["phoneme_counts"]),   # new-coverage gain
+                len(s["phoneme_counts"]),
+                -abs(s["word_count"] - target_word_count),
+            ),
+        )
     return max(
         eligible,
         key=lambda s: (len(s["phoneme_counts"]), -abs(s["word_count"] - target_word_count)),
@@ -216,27 +332,50 @@ def llm_available() -> bool:
     return _get_client() is not None
 
 
+_LEVEL_GUIDANCE = {
+    "beginner": "Use short, common, everyday words and simple grammar (CEFR A1-A2 style).",
+    "intermediate": "Use moderately varied vocabulary and natural sentence structure (CEFR B1-B2 style).",
+    "advanced": "You may use richer vocabulary and more complex structure (CEFR C1 style).",
+    "unknown": "Use clear, natural, everyday language of moderate difficulty.",
+}
+
+
 def generate_candidate_text(
     target_phonemes: List[str],
     avoid_phonemes: Iterable[str],
-    level_hint: float,
+    level: Optional[str] = None,
+    confusion_hint: Optional[str] = None,
 ) -> Optional[str]:
-    """One LLM-proposed sentence via Qwen. Returns None on any failure (no
-    key, no package, API error) so the caller falls back to the retrieval
-    bank -- generation is a bonus, never a hard dependency."""
+    """One LLM-proposed sentence. Returns None on any failure (no key, no
+    package, API error) so the caller falls back to the retrieval bank --
+    generation is a bonus, never a hard dependency.
+
+    The learner ``level`` is now actually included in the prompt so difficulty
+    is steered, and a ``confusion_hint`` (e.g. "θ vs s") requests contrastive
+    material for a known confusion.
+    """
     client = _get_client()
     if client is None:
         return None
 
     avoid_list = ", ".join(sorted(avoid_phonemes)) or "none"
+    level = (level or "unknown").lower()
+    level_line = _LEVEL_GUIDANCE.get(level, _LEVEL_GUIDANCE["unknown"])
+    confusion_line = (
+        f"The learner tends to confuse {confusion_hint}; include contrasting words that "
+        "make that distinction clear.\n"
+        if confusion_hint else ""
+    )
     prompt = (
         f"Write ONE natural English sentence of at most {MAX_WORD_COUNT} words for a "
         "pronunciation-practice app.\n"
+        f"Learner level: {level}. {level_line}\n"
         f"Focus tightly on these {len(target_phonemes)} IPA target sound(s): "
         f"{', '.join(target_phonemes)}.\n"
-        "Pack in as many words containing those target sounds as you naturally can, so the "
-        "learner gets lots of repetitions of them -- but keep the sentence grammatical and "
-        "meaningful, not a random word list.\n"
+        f"Include each target sound at least {MIN_TARGET_REPETITIONS} times using natural words, so the "
+        "learner gets repetitions -- but keep the sentence grammatical and meaningful, not a "
+        "random word list.\n"
+        f"{confusion_line}"
         f"Avoid overusing these already-mastered sounds: {avoid_list}.\n"
         "Respond with ONLY the sentence itself -- no quotes, no explanation, no preamble."
     )
@@ -275,32 +414,74 @@ def too_many_overmastered(phoneme_counts: Dict[str, int], overmastered_phonemes:
     return (overmastered_present / len(phoneme_counts)) > max_fraction
 
 
+def meets_min_repetitions(
+    phoneme_counts: Dict[str, int],
+    target_phonemes: List[str],
+    min_reps: int = MIN_TARGET_REPETITIONS,
+) -> bool:
+    """At least one target phoneme must appear ``min_reps`` times so the
+    exercise gives real repetition of a target sound."""
+    if not target_phonemes:
+        return True
+    return any(phoneme_counts.get(p, 0) >= min_reps for p in target_phonemes)
+
+
+def verify_generated_exercise(
+    tagged: Dict,
+    target_phonemes: List[str],
+    overmastered_phonemes: Iterable[str],
+    min_reps: int = MIN_TARGET_REPETITIONS,
+) -> tuple[bool, List[str]]:
+    """Check a generated (already-tagged) exercise against acceptance rules.
+    Returns (ok, reasons_for_rejection). Rules: valid/supported G2P output,
+    max length, target coverage, minimum target repetitions, and not padded
+    with already-mastered sounds."""
+    reasons: List[str] = []
+    if not is_valid_tagging(tagged):
+        reasons.append("untaggable_or_oov")
+    else:
+        report = validate_g2p_inventory(tagged["phoneme_counts"].keys())
+        if not report["ok"]:
+            reasons.append(f"unsupported_phonemes:{report['unsupported']}")
+    if tagged.get("word_count", 0) > MAX_WORD_COUNT:
+        reasons.append("too_long")
+    if not covers_targets(tagged.get("phoneme_counts", {}), target_phonemes):
+        reasons.append("insufficient_target_coverage")
+    if not meets_min_repetitions(tagged.get("phoneme_counts", {}), target_phonemes, min_reps):
+        reasons.append("insufficient_target_repetitions")
+    if too_many_overmastered(tagged.get("phoneme_counts", {}), overmastered_phonemes):
+        reasons.append("overmastered_padding")
+    return (not reasons, reasons)
+
+
 def generate_and_verify_exercise(
     target_phonemes: List[str],
     overmastered_phonemes: Iterable[str],
-    level_hint: float,
     g2p_convert: Callable[[str], str],
     ipa_to_tokens: Callable[[str], List[str]],
+    level: Optional[str] = None,
+    confusion_hint: Optional[str] = None,
     max_attempts: int = GENERATION_MAX_ATTEMPTS,
 ) -> Optional[Dict]:
-    """Rejection-sampling loop: ask the LLM for a candidate, verify it with
-    the SAME G2P pipeline used for scoring (never a separate/simplified
-    check), accept only if it actually covers the target phonemes without
-    padding itself with already-mastered ones. Returns None -- never a
-    silently-unverified sentence -- if nothing passes within max_attempts."""
+    """Rejection-sampling loop: ask the LLM for a candidate, verify it with the
+    SAME G2P pipeline used for scoring (never a separate/simplified check),
+    accept only a candidate that passes every rule in
+    ``verify_generated_exercise``. Returns None -- never a silently-unverified
+    sentence -- if nothing passes within ``max_attempts``.
+
+    ``level`` is the learner's assessed level (steers difficulty in the
+    prompt); ``confusion_hint`` requests contrastive material.
+    """
     overmastered_phonemes = set(overmastered_phonemes)
     for _ in range(max_attempts):
-        candidate_text = generate_candidate_text(target_phonemes, overmastered_phonemes, level_hint)
+        candidate_text = generate_candidate_text(
+            target_phonemes, overmastered_phonemes, level=level, confusion_hint=confusion_hint
+        )
         if not candidate_text:
             return None  # no client available or the call failed -- don't keep retrying
         tagged = tag_sentence(candidate_text, g2p_convert, ipa_to_tokens)
-        if not is_valid_tagging(tagged):
-            continue
-        if tagged["word_count"] > MAX_WORD_COUNT:
-            continue  # too long -- reject and let the model try again
-        if covers_targets(tagged["phoneme_counts"], target_phonemes) and not too_many_overmastered(
-            tagged["phoneme_counts"], overmastered_phonemes
-        ):
+        ok, _reasons = verify_generated_exercise(tagged, target_phonemes, overmastered_phonemes)
+        if ok:
             tagged["source"] = "llm_generated"
             return tagged
     return None

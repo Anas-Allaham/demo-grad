@@ -90,6 +90,107 @@ CREATE INDEX IF NOT EXISTS idx_practice_assignments_user
     ON practice_assignments(user_id, assigned_at);
 """
 
+# Non-destructive additive migrations. Each entry is a column that newer code
+# needs; `migrate()` adds any that a pre-existing database is missing via
+# PRAGMA table_info + ALTER TABLE, so an old app.db keeps all its data.
+COLUMN_MIGRATIONS: Dict[str, List[tuple]] = {
+    # Separate the concepts the old schema merged under a single `distance`.
+    "attempt_phoneme_events": [
+        ("articulatory_distance", "REAL"),  # raw PanPhon feature distance [0,1]
+        ("alignment_cost", "REAL"),         # DP alignment cost (NOT a distance)
+    ],
+    # occurrence_count (phoneme occurrences) is tracked separately from
+    # attempts_count, which now means independent recordings.
+    "phoneme_skill_state": [
+        ("occurrence_count", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    # Richer per-attempt bookkeeping + audio-quality gating.
+    "attempts": [
+        ("raw_weighted_per", "REAL"),
+        ("quality_weight", "REAL"),
+        ("scorable", "INTEGER NOT NULL DEFAULT 1"),
+        ("rejected_reason", "TEXT"),
+    ],
+}
+
+
+_PRIOR = 1.0
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Add any columns newer code needs that an existing DB lacks, then
+    canonicalize legacy phoneme keys. Purely additive / evidence-preserving:
+    never drops or destroys user data."""
+    for table, columns in COLUMN_MIGRATIONS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.commit()
+    _canonicalize_phoneme_states(conn)
+
+
+def _canonicalize_phoneme_states(conn: sqlite3.Connection) -> None:
+    """One-time, idempotent, non-destructive cleanup: fold legacy
+    non-canonical phoneme_skill_state keys (e.g. 'r', 'iː', 'ɔr') into their
+    canonical form ('ɹ', 'i', ...), MERGING their Beta evidence rather than
+    dropping any. A no-op once every key is already canonical."""
+    from phoneme_vectors_professional import canonicalize_phoneme
+
+    rows = conn.execute(
+        "SELECT user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at "
+        "FROM phoneme_skill_state"
+    ).fetchall()
+
+    # Nothing to do if every stored key is already canonical and unique.
+    needs_work = False
+    seen = set()
+    for r in rows:
+        canon = canonicalize_phoneme(r["phoneme"])
+        key = (r["user_id"], canon)
+        if canon != r["phoneme"] or key in seen:
+            needs_work = True
+            break
+        seen.add(key)
+    if not needs_work:
+        return
+
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for r in rows:
+        canon = canonicalize_phoneme(r["phoneme"])
+        if not canon:
+            continue
+        key = (r["user_id"], canon)
+        acc = merged.get(key)
+        if acc is None:
+            merged[key] = {
+                "alpha": r["alpha"],
+                "beta": r["beta"],
+                "attempts_count": r["attempts_count"] or 0,
+                "occurrence_count": (r["occurrence_count"] or 0),
+                "last_practiced_at": r["last_practiced_at"],
+            }
+        else:
+            # Combine evidence above the shared prior so priors don't stack.
+            acc["alpha"] += (r["alpha"] - _PRIOR)
+            acc["beta"] += (r["beta"] - _PRIOR)
+            acc["attempts_count"] += (r["attempts_count"] or 0)
+            acc["occurrence_count"] += (r["occurrence_count"] or 0)
+            if (r["last_practiced_at"] or "") > (acc["last_practiced_at"] or ""):
+                acc["last_practiced_at"] = r["last_practiced_at"]
+
+    conn.execute("DELETE FROM phoneme_skill_state")
+    conn.executemany(
+        """INSERT INTO phoneme_skill_state
+               (user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (uid, ph, v["alpha"], v["beta"], v["attempts_count"], v["occurrence_count"], v["last_practiced_at"])
+            for (uid, ph), v in merged.items()
+        ],
+    )
+    conn.commit()
+
 
 def get_connection() -> sqlite3.Connection:
     """Lazily-opened, process-wide connection. WAL mode keeps a single
@@ -107,6 +208,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn = conn or get_connection()
     conn.executescript(SCHEMA)
     conn.commit()
+    migrate(conn)
 
 
 # -----------------------------
@@ -151,14 +253,24 @@ def record_attempt(
     phoneme_error_rate: float,
     weighted_error: float,
     exercise_id: Optional[int] = None,
+    raw_weighted_per: Optional[float] = None,
+    quality_weight: Optional[float] = None,
+    scorable: bool = True,
+    rejected_reason: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> int:
     conn = conn or get_connection()
     cur = conn.execute(
         """INSERT INTO attempts
-           (user_id, exercise_id, text, reference_ipa, predicted_ipa, phoneme_error_rate, weighted_error)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, exercise_id, text, reference_ipa, predicted_ipa, phoneme_error_rate, weighted_error),
+           (user_id, exercise_id, text, reference_ipa, predicted_ipa,
+            phoneme_error_rate, weighted_error, raw_weighted_per,
+            quality_weight, scorable, rejected_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            user_id, exercise_id, text, reference_ipa, predicted_ipa,
+            phoneme_error_rate, weighted_error, raw_weighted_per,
+            quality_weight, 1 if scorable else 0, rejected_reason,
+        ),
     )
     conn.commit()
     return cur.lastrowid
@@ -170,21 +282,28 @@ def record_phoneme_events(
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     conn = conn or get_connection()
-    rows = [
-        (
+    rows = []
+    for position, row in enumerate(alignment):
+        art = row.get("articulatory_distance", row.get("distance"))
+        cost = row.get("alignment_cost")
+        # `distance` stays NOT NULL for backward compatibility; fall back to
+        # the alignment cost for gap rows that have no articulatory distance.
+        compat_distance = art if art is not None else (cost if cost is not None else 0.0)
+        rows.append((
             attempt_id,
             position,
             None if row.get("expected") in (None, "-") else row["expected"],
             None if row.get("spoken") in (None, "-") else row["spoken"],
             row.get("result"),
-            float(row.get("distance", 0.0)),
-        )
-        for position, row in enumerate(alignment)
-    ]
+            float(compat_distance),
+            None if art is None else float(art),
+            None if cost is None else float(cost),
+        ))
     conn.executemany(
         """INSERT INTO attempt_phoneme_events
-           (attempt_id, position, expected_phoneme, spoken_phoneme, operation, distance)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+           (attempt_id, position, expected_phoneme, spoken_phoneme, operation,
+            distance, articulatory_distance, alignment_cost)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
     conn.commit()
@@ -231,18 +350,24 @@ def upsert_phoneme_state(
     beta: float,
     attempts_count: int,
     last_practiced_at: str,
+    occurrence_count: int = 0,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
+    """Persist one phoneme's mastery state. ``attempts_count`` now means the
+    number of independent recordings; ``occurrence_count`` is the number of
+    phoneme occurrences observed."""
     conn = conn or get_connection()
     conn.execute(
-        """INSERT INTO phoneme_skill_state (user_id, phoneme, alpha, beta, attempts_count, last_practiced_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+        """INSERT INTO phoneme_skill_state
+               (user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id, phoneme) DO UPDATE SET
                alpha=excluded.alpha,
                beta=excluded.beta,
                attempts_count=excluded.attempts_count,
+               occurrence_count=excluded.occurrence_count,
                last_practiced_at=excluded.last_practiced_at""",
-        (user_id, phoneme, alpha, beta, attempts_count, last_practiced_at),
+        (user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at),
     )
     conn.commit()
 
@@ -284,6 +409,28 @@ def get_sentence_by_id(sentence_id: int, conn: Optional[sqlite3.Connection] = No
     return conn.execute("SELECT * FROM exercise_bank WHERE id = ?", (sentence_id,)).fetchone()
 
 
+def update_sentence_tags(
+    sentence_id: int,
+    reference_ipa: str,
+    phoneme_counts: Dict[str, int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Re-tag an existing bank sentence in place: refresh its reference IPA and
+    replace its phoneme tags. Content-only -- never touches user history
+    (attempts / mastery), so it is safe to re-canonicalize an old bank."""
+    conn = conn or get_connection()
+    conn.execute(
+        "UPDATE exercise_bank SET reference_ipa = ? WHERE id = ?",
+        (reference_ipa, sentence_id),
+    )
+    conn.execute("DELETE FROM sentence_phonemes WHERE sentence_id = ?", (sentence_id,))
+    conn.executemany(
+        "INSERT INTO sentence_phonemes (sentence_id, phoneme, count) VALUES (?, ?, ?)",
+        [(sentence_id, phoneme, count) for phoneme, count in phoneme_counts.items()],
+    )
+    conn.commit()
+
+
 def get_sentence_phonemes(sentence_id: int, conn: Optional[sqlite3.Connection] = None) -> Dict[str, int]:
     conn = conn or get_connection()
     rows = conn.execute(
@@ -314,6 +461,21 @@ def get_all_sentences(conn: Optional[sqlite3.Connection] = None) -> List[Dict[st
     conn = conn or get_connection()
     ids = [row["id"] for row in conn.execute("SELECT id FROM exercise_bank").fetchall()]
     return [_load_sentence_with_phonemes(sid, conn) for sid in ids]
+
+
+def count_exercise_bank(conn: Optional[sqlite3.Connection] = None) -> int:
+    conn = conn or get_connection()
+    row = conn.execute("SELECT COUNT(*) AS n FROM exercise_bank").fetchone()
+    return int(row["n"]) if row else 0
+
+
+def get_all_bank_phonemes(conn: Optional[sqlite3.Connection] = None) -> List[str]:
+    """Distinct phonemes currently tagged into the exercise bank -- used by the
+    startup inventory validation and /health."""
+    conn = conn or get_connection()
+    return [row["phoneme"] for row in conn.execute(
+        "SELECT DISTINCT phoneme FROM sentence_phonemes"
+    ).fetchall()]
 
 
 def _load_sentence_with_phonemes(sentence_id: int, conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -380,3 +542,81 @@ def get_recently_served_sentence_ids(user_id: int, limit: int = 15, conn: Option
         (user_id, limit),
     ).fetchall()
     return {row["exercise_id"] for row in rows}
+
+
+# -----------------------------
+# Evidence / confusion aggregation for assessment + confusion-aware exercises
+# -----------------------------
+def _scorable_filter() -> str:
+    """SQL fragment: only count attempts that passed the audio-quality gate.
+    Tolerates pre-migration rows where `scorable` is NULL."""
+    return "(a.scorable IS NULL OR a.scorable != 0)"
+
+
+def get_phoneme_context_stats(
+    user_id: int, conn: Optional[sqlite3.Connection] = None
+) -> Dict[str, Dict[str, int]]:
+    """Per expected phoneme: how many independent recordings it appeared in
+    and across how many distinct prompt texts. Used by evidence-aware level
+    eligibility (>= N recordings across >= M prompts)."""
+    conn = conn or get_connection()
+    rows = conn.execute(
+        f"""SELECT e.expected_phoneme AS phoneme,
+                   COUNT(DISTINCT a.id) AS recordings,
+                   COUNT(DISTINCT a.text) AS distinct_prompts,
+                   COUNT(*) AS occurrences
+            FROM attempt_phoneme_events e
+            JOIN attempts a ON e.attempt_id = a.id
+            WHERE a.user_id = ?
+              AND e.expected_phoneme IS NOT NULL
+              AND {_scorable_filter()}
+            GROUP BY e.expected_phoneme""",
+        (user_id,),
+    ).fetchall()
+    return {
+        row["phoneme"]: {
+            "recordings": row["recordings"],
+            "distinct_prompts": row["distinct_prompts"],
+            "occurrences": row["occurrences"],
+        }
+        for row in rows
+    }
+
+
+def get_confusion_pairs(
+    user_id: int, limit: Optional[int] = None, conn: Optional[sqlite3.Connection] = None
+) -> List[Dict[str, Any]]:
+    """Most frequent expected->spoken substitution pairs for a user, ordered
+    by frequency. Feeds confusion-aware exercise selection (e.g. θ->s)."""
+    conn = conn or get_connection()
+    query = f"""SELECT e.expected_phoneme AS expected,
+                       e.spoken_phoneme AS spoken,
+                       COUNT(*) AS count
+                FROM attempt_phoneme_events e
+                JOIN attempts a ON e.attempt_id = a.id
+                WHERE a.user_id = ?
+                  AND e.operation LIKE '%substitution%'
+                  AND e.expected_phoneme IS NOT NULL
+                  AND e.spoken_phoneme IS NOT NULL
+                  AND {_scorable_filter()}
+                GROUP BY e.expected_phoneme, e.spoken_phoneme
+                ORDER BY count DESC"""
+    params: tuple = (user_id,)
+    if limit is not None:
+        query += " LIMIT ?"
+        params = (user_id, limit)
+    rows = conn.execute(query, params).fetchall()
+    return [
+        {"expected": row["expected"], "spoken": row["spoken"], "count": row["count"]}
+        for row in rows
+    ]
+
+
+def get_scorable_recording_count(user_id: int, conn: Optional[sqlite3.Connection] = None) -> int:
+    """Number of the user's recordings that passed the audio-quality gate."""
+    conn = conn or get_connection()
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM attempts a WHERE a.user_id = ? AND {_scorable_filter()}",
+        (user_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0

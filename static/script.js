@@ -212,8 +212,23 @@ analyzeBtn.onclick = async () => {
             return;
         }
 
+        // Audio-quality gate: an unscorable recording is not scored and does
+        // not update mastery. Ask the user to record again.
+        if (data.scorable === false) {
+            document.getElementById("results").classList.add("hidden");
+            const reasons = (data.audio_quality && data.audio_quality.reasons || []).join(", ");
+            statusText.textContent =
+                (data.message || "That recording could not be scored. Please record again.") +
+                (reasons ? " (" + reasons + ")" : "");
+            currentSentenceId = null;
+            return;
+        }
+
         showResults(data);
         let statusMessage = "Analysis complete.";
+        if (data.scoring_trusted === false && data.mastery_note) {
+            statusMessage = data.mastery_note;
+        }
         if (data.reduced_audio_url && data.noise_reduction_applied) {
             statusMessage = "Analysis complete. You can now play the noise-reduced audio.";
         } else if (data.reduced_audio_url) {
@@ -222,13 +237,15 @@ analyzeBtn.onclick = async () => {
             statusMessage = "Analysis complete. Noise reduction package is not installed, so denoised playback is unavailable.";
         }
 
-        const quality = data.audio_quality_check;
-        if (quality && quality.possible_dropout) {
-            statusMessage += " Warning: possible dropouts were detected in the raw recording.";
+        const quality = data.audio_quality;
+        if (quality && quality.metrics && quality.quality_weight !== undefined && quality.quality_weight < 0.75) {
+            statusMessage += " Note: audio quality was borderline.";
         }
 
-        if (data.profile) {
+        if (data.profile && data.mastery_updated) {
             statusMessage += ` Counted toward ${data.profile.name}'s progress.`;
+        } else if (data.profile && data.scoring_trusted === false) {
+            statusMessage += " (Provisional score shown; progress not updated.)";
         }
 
         statusText.textContent = statusMessage;
@@ -547,7 +564,19 @@ nextExerciseBtn.onclick = async () => {
         }
 
         adaptiveExerciseInfo.classList.remove("hidden");
-        adaptiveStatus.textContent = "Record yourself reading the sentence above, then click Analyze.";
+        let statusLine = "Record yourself reading the sentence above, then click Analyze.";
+        if (data.assessment) {
+            const a = data.assessment;
+            const score = a.pronunciation_score === null ? "n/a" : a.pronunciation_score;
+            statusLine += ` Provisional level: ${a.overall_level} (${a.assessment_status}, score ${score}/100).`;
+            if (data.exercise_type) {
+                statusLine += ` Exercise type: ${data.exercise_type.replace(/_/g, " ")}.`;
+            }
+            if (data.confusion_hint) {
+                statusLine += ` Focus: ${data.confusion_hint}.`;
+            }
+        }
+        adaptiveStatus.textContent = statusLine;
 
         document.getElementById("results").classList.add("hidden");
         recordedBlob = null;

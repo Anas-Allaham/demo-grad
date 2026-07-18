@@ -48,7 +48,10 @@ def peak_normalize(audio: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
 def mild_noise_reduce(audio: np.ndarray, sr: int, prop_decrease: float = 0.35) -> np.ndarray:
     """
     Mild noisereduce wrapper.
-    This intentionally uses a low prop_decrease to avoid deleting quiet phonemes.
+
+    Uses a low ``prop_decrease`` and a non-stationary estimate so quiet
+    phonemes survive. The first 250 ms is passed as the noise profile
+    (``y_noise``) rather than discarded, which is the intended behaviour.
     """
     if nr is None:
         return audio
@@ -58,15 +61,15 @@ def mild_noise_reduce(audio: np.ndarray, sr: int, prop_decrease: float = 0.35) -
         # Short clips often do not contain a reliable noise profile.
         return audio
 
-    # Use only the first 250 ms as a possible noise profile.
-    # If the user starts speaking immediately, this may still be imperfect,
-    # so keep prop_decrease mild.
+    # Use only the first 250 ms as a possible noise profile. If the user
+    # starts speaking immediately this is imperfect, so keep prop_decrease mild.
     noise_clip = audio[: int(0.25 * sr)]
     return nr.reduce_noise(
         y=audio,
         sr=sr,
         y_noise=noise_clip,
-
+        stationary=False,
+        prop_decrease=prop_decrease,
     ).astype(np.float32)
 
 

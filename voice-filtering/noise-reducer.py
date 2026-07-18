@@ -21,18 +21,25 @@ def bandpass_filter(data, lowcut=80.0, highcut=4000.0, fs=16000, order=5):
     y = lfilter(b, a, data)
     return y
 
-def reduce_noise(audio_array, sr, noise_clip=None, use_noisereduce=True):
+def reduce_noise(audio_array, sr, noise_clip=None, use_noisereduce=True, prop_decrease=0.35):
     """
     Reduce noise from audio using noisereduce if available.
-    If noise_clip is provided, it will use it as the noise profile.
+    If noise_clip is provided, it is used as the noise profile.
     """
     if use_noisereduce and NOISEREDUCE_AVAILABLE:
-        print('used reducer')
-        filtered_audio = nr.reduce_noise(y=audio_array, sr=sr)
-        return filtered_audio
-    else:
-        # If noisereduce is unavailable or disabled, return original
-        return audio_array
+        if noise_clip is not None:
+            return nr.reduce_noise(
+                y=audio_array,
+                sr=sr,
+                y_noise=noise_clip,
+                stationary=False,
+                prop_decrease=prop_decrease,
+            )
+        return nr.reduce_noise(
+            y=audio_array, sr=sr, stationary=False, prop_decrease=prop_decrease
+        )
+    # If noisereduce is unavailable or disabled, return original
+    return audio_array
 
 def process_audio(input_file, output_file, lowcut=80.0, highcut=4000.0, use_noise_reduction=True):
     """

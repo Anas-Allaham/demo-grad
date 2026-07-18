@@ -9,6 +9,10 @@ panphon
 scipy
 python-dotenv
 
+# Test runner (unit tests do not require torch/panphon; the acoustic layer is
+# mocked/bypassed).
+pytest
+
 # Optional: only needed for the LLM-generation fallback in content.py.
 # Talks to an LLM over an OpenAI-compatible endpoint; defaults to Google AI
 # Studio (Gemini) -- set GEMINI_API_KEY to enable. The app runs fully

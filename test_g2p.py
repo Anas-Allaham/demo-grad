@@ -1,4 +1,9 @@
-from app import g2p_convert, g2p_mode, load_g2p_engine
+"""Quick manual G2P smoke check: python test_g2p.py
+
+Imports g2p_service directly (not app.py), so it runs without torch/Wav2Vec2.
+"""
+
+from g2p_service import g2p_convert, get_g2p_mode, load_g2p_engine
 
 load_g2p_engine()
 
@@ -14,4 +19,4 @@ for text in examples:
     print("IPA :", g2p_convert(text))
     print()
 
-print("G2P mode:", g2p_mode)
+print("G2P mode:", get_g2p_mode())
