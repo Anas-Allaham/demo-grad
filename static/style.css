@@ -202,27 +202,44 @@ th {
     color: white;
 }
 
+.correct,
+.substitution,
+.minor_substitution,
+.very_close_substitution,
+.close_substitution,
+.medium_substitution,
+.major_substitution,
+.vowel_consonant_substitution,
+.unknown_substitution,
+.deletion,
+.insertion {
+    font-weight: 800;
+}
+
 .correct {
     color: #15803d;
-    font-weight: 800;
 }
 
 .substitution,
 .minor_substitution,
+.very_close_substitution,
+.close_substitution,
 .medium_substitution,
 .major_substitution {
     color: #c2410c;
-    font-weight: 800;
+}
+
+.vowel_consonant_substitution,
+.unknown_substitution {
+    color: #b91c1c;
 }
 
 .deletion {
     color: #b91c1c;
-    font-weight: 800;
 }
 
 .insertion {
     color: #7e22ce;
-    font-weight: 800;
 }
 
 

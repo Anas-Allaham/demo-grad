@@ -66,8 +66,7 @@ def mild_noise_reduce(audio: np.ndarray, sr: int, prop_decrease: float = 0.35) -
         y=audio,
         sr=sr,
         y_noise=noise_clip,
-        stationary=False,
-        prop_decrease=prop_decrease,
+
     ).astype(np.float32)
 
 

@@ -26,7 +26,7 @@ try:
 except Exception:
     pass  # python-dotenv is optional; env vars set in the shell still work
 
-from phoneme_vectors import canonicalize_phoneme, phoneme_distance, substitution_label, panphon_available
+from phoneme_vectors_professional import canonicalize_phoneme, phoneme_distance, panphon_available
 import librosa
 import torch
 from flask import Flask, jsonify, render_template, request, send_from_directory
@@ -566,6 +566,69 @@ def transcribe_audio_to_phonemes(audio_path: Path):
 #     operations.reverse()
 #     return aligned_ref, aligned_hyp, operations
 
+# -----------------------------
+# Alignment cost model
+# -----------------------------
+MATCH_COST = 0.0
+
+DELETION_COST = 0.85
+INSERTION_COST = 0.85
+
+VERY_CLOSE_SUB_COST = 0.25
+CLOSE_SUB_COST = 0.45
+MEDIUM_SUB_COST = 0.75
+MAJOR_SUB_COST = 1.05
+
+VOWEL_CONSONANT_SUB_COST = 1.35
+UNKNOWN_SUB_COST = 1.20
+
+VOWEL_PHONEMES = {
+    "i", "iː", "ɪ", "e", "ɛ", "æ", "ɑ", "ɔ", "ʊ", "u", "uː", "ʌ", "ə", "ɝ", "ɚ",
+    "aɪ", "aʊ", "eɪ", "oʊ", "ɔɪ",
+}
+
+CONSONANT_PHONEMES = {
+    "p", "b", "t", "d", "k", "g", "ɡ", "f", "v", "θ", "ð", "s", "z", "ʃ", "ʒ", "h",
+    "tʃ", "dʒ", "m", "n", "ŋ", "l", "ɹ", "r", "w", "j",
+}
+
+KNOWN_PHONEMES = {canonicalize_phoneme(ph) for ph in (VOWEL_PHONEMES | CONSONANT_PHONEMES)}
+
+
+def _is_vowel(phoneme: str) -> bool:
+    return canonicalize_phoneme(phoneme) in VOWEL_PHONEMES
+
+
+def _is_known_phoneme(phoneme: str) -> bool:
+    return canonicalize_phoneme(phoneme) in KNOWN_PHONEMES
+
+
+def substitution_cost_and_label(ref_ph: str, hyp_ph: str):
+    ref_ph = canonicalize_phoneme(ref_ph)
+    hyp_ph = canonicalize_phoneme(hyp_ph)
+
+    if ref_ph == hyp_ph:
+        return MATCH_COST, "correct"
+
+    if not _is_known_phoneme(ref_ph) or not _is_known_phoneme(hyp_ph):
+        return UNKNOWN_SUB_COST, "unknown_substitution"
+
+    if _is_vowel(ref_ph) != _is_vowel(hyp_ph):
+        return VOWEL_CONSONANT_SUB_COST, "vowel_consonant_substitution"
+
+    try:
+        distance_value = phoneme_distance(ref_ph, hyp_ph)
+    except Exception:
+        return UNKNOWN_SUB_COST, "unknown_substitution"
+
+    if distance_value <= 0.15:
+        return VERY_CLOSE_SUB_COST, "very_close_substitution"
+    if distance_value <= 0.35:
+        return CLOSE_SUB_COST, "close_substitution"
+    if distance_value <= 0.65:
+        return MEDIUM_SUB_COST, "medium_substitution"
+    return MAJOR_SUB_COST, "major_substitution"
+
 
 def align_phonemes(ref_seq, hyp_seq):
     n = len(ref_seq)
@@ -574,15 +637,12 @@ def align_phonemes(ref_seq, hyp_seq):
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     backtrack = [[None] * (m + 1) for _ in range(n + 1)]
 
-    deletion_cost = 1.0
-    insertion_cost = 1.0
-
     for i in range(1, n + 1):
-        dp[i][0] = i * deletion_cost
+        dp[i][0] = i * DELETION_COST
         backtrack[i][0] = "UP"
 
     for j in range(1, m + 1):
-        dp[0][j] = j * insertion_cost
+        dp[0][j] = j * INSERTION_COST
         backtrack[0][j] = "LEFT"
 
     for i in range(1, n + 1):
@@ -590,11 +650,11 @@ def align_phonemes(ref_seq, hyp_seq):
             ref_ph = ref_seq[i - 1]
             hyp_ph = hyp_seq[j - 1]
 
-            sub_cost = phoneme_distance(ref_ph, hyp_ph)
+            sub_cost, _ = substitution_cost_and_label(ref_ph, hyp_ph)
 
             diag = dp[i - 1][j - 1] + sub_cost
-            up = dp[i - 1][j] + deletion_cost
-            left = dp[i][j - 1] + insertion_cost
+            up = dp[i - 1][j] + DELETION_COST
+            left = dp[i][j - 1] + INSERTION_COST
 
             best = min(diag, up, left)
             dp[i][j] = best
@@ -623,16 +683,13 @@ def align_phonemes(ref_seq, hyp_seq):
         if move == "DIAG":
             ref_ph = ref_seq[i - 1]
             hyp_ph = hyp_seq[j - 1]
-            dist = phoneme_distance(ref_ph, hyp_ph)
+            dist, label = substitution_cost_and_label(ref_ph, hyp_ph)
 
             aligned_ref.append(ref_ph)
             aligned_hyp.append(hyp_ph)
             distances.append(round(dist, 3))
 
-            if ref_ph == hyp_ph:
-                operations.append("correct")
-            else:
-                operations.append(substitution_label(dist))
+            operations.append(label)
 
             i -= 1
             j -= 1
@@ -641,14 +698,14 @@ def align_phonemes(ref_seq, hyp_seq):
             aligned_ref.append(ref_seq[i - 1])
             aligned_hyp.append("-")
             operations.append("deletion")
-            distances.append(1.0)
+            distances.append(DELETION_COST)
             i -= 1
 
         elif move == "LEFT":
             aligned_ref.append("-")
             aligned_hyp.append(hyp_seq[j - 1])
             operations.append("insertion")
-            distances.append(1.0)
+            distances.append(INSERTION_COST)
             j -= 1
 
     aligned_ref.reverse()
@@ -683,18 +740,23 @@ def align_phonemes(ref_seq, hyp_seq):
 def calculate_metrics(operations: List[str], distances: List[float] | None = None):
     total_reference_units = len([op for op in operations if op != "insertion"])
 
-    minor = operations.count("minor_substitution")
+    very_close = operations.count("very_close_substitution")
+    close = operations.count("close_substitution")
     medium = operations.count("medium_substitution")
     major = operations.count("major_substitution")
+    vowel_consonant = operations.count("vowel_consonant_substitution")
+    unknown = operations.count("unknown_substitution")
 
-    substitutions = minor + medium + major
+    substitutions = sum(1 for op in operations if op.endswith("_substitution"))
     deletions = operations.count("deletion")
     insertions = operations.count("insertion")
     correct = operations.count("correct")
 
+    minor = very_close + close
+    major_total = major + vowel_consonant + unknown
+
     if distances and len(distances) == len(operations):
-        # Research-based weighted PER: sum the actual normalized phoneme distances.
-        # Correct = 0, insertion/deletion = 1, substitution = PanPhon normalized distance.
+        # Weighted PER from the configured alignment costs.
         weighted_error = sum(
             dist for op, dist in zip(operations, distances)
             if op != "correct"
@@ -702,11 +764,14 @@ def calculate_metrics(operations: List[str], distances: List[float] | None = Non
     else:
         # Fallback if distances are unavailable.
         weighted_error = (
-            minor * 0.33 +
-            medium * 0.66 +
-            major * 1.0 +
-            deletions * 1.0 +
-            insertions * 1.0
+            very_close * VERY_CLOSE_SUB_COST +
+            close * CLOSE_SUB_COST +
+            medium * MEDIUM_SUB_COST +
+            major * MAJOR_SUB_COST +
+            vowel_consonant * VOWEL_CONSONANT_SUB_COST +
+            unknown * UNKNOWN_SUB_COST +
+            deletions * DELETION_COST +
+            insertions * INSERTION_COST
         )
 
     if total_reference_units > 0:
@@ -719,7 +784,11 @@ def calculate_metrics(operations: List[str], distances: List[float] | None = Non
         "substitutions": substitutions,
         "minor_substitutions": minor,
         "medium_substitutions": medium,
-        "major_substitutions": major,
+        "major_substitutions": major_total,
+        "very_close_substitutions": very_close,
+        "close_substitutions": close,
+        "vowel_consonant_substitutions": vowel_consonant,
+        "unknown_substitutions": unknown,
         "deletions": deletions,
         "insertions": insertions,
         "weighted_error": round(weighted_error, 3),
