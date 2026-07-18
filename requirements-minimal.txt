@@ -6,3 +6,11 @@ soundfile
 numpy
 noisereduce
 panphon
+scipy
+python-dotenv
+
+# Optional: only needed for the LLM-generation fallback in content.py.
+# Talks to an LLM over an OpenAI-compatible endpoint; defaults to Google AI
+# Studio (Gemini) -- set GEMINI_API_KEY to enable. The app runs fully
+# offline/retrieval-only without it.
+openai

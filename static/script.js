@@ -2,6 +2,9 @@ let mediaRecorder;
 let audioChunks = [];
 let recordedBlob = null;
 
+let activeProfile = localStorage.getItem("pronunciation_profile") || "";
+let currentSentenceId = null;
+
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const analyzeBtn = document.getElementById("analyzeBtn");
@@ -183,6 +186,12 @@ analyzeBtn.onclick = async () => {
     const formData = new FormData();
     formData.append("text", text);
     formData.append("audio", recordedBlob, "raw_browser_recording.webm");
+    if (activeProfile) {
+        formData.append("user", activeProfile);
+    }
+    if (currentSentenceId !== null) {
+        formData.append("sentence_id", currentSentenceId);
+    }
 
     document.getElementById("loading").classList.remove("hidden");
     document.getElementById("results").classList.add("hidden");
@@ -218,7 +227,15 @@ analyzeBtn.onclick = async () => {
             statusMessage += " Warning: possible dropouts were detected in the raw recording.";
         }
 
+        if (data.profile) {
+            statusMessage += ` Counted toward ${data.profile.name}'s progress.`;
+        }
+
         statusText.textContent = statusMessage;
+
+        // The exercise this attempt was scored against is now used up --
+        // require fetching a fresh one before the assignment link is reused.
+        currentSentenceId = null;
     } catch (error) {
         document.getElementById("loading").classList.add("hidden");
         alert("Request failed: " + error.message);
@@ -360,4 +377,265 @@ function stopTextReader(silent = false) {
     if (!silent) {
         statusText.textContent = "Reader stopped.";
     }
+}
+
+// -----------------------------
+// Profiles -- no auth, a "profile" is just a name (see db.get_or_create_user)
+// -----------------------------
+const profileSelect = document.getElementById("profileSelect");
+const profileStatus = document.getElementById("profileStatus");
+const NEW_PROFILE_VALUE = "__new__";
+
+async function loadProfiles(selectAfterLoad) {
+    try {
+        const response = await fetch("/users");
+        const users = await response.json();
+
+        profileSelect.innerHTML = "";
+        const noneOption = document.createElement("option");
+        noneOption.value = "";
+        noneOption.textContent = "No profile (Free Practice only)";
+        profileSelect.appendChild(noneOption);
+
+        users.forEach(user => {
+            const option = document.createElement("option");
+            option.value = user.name;
+            option.textContent = user.name;
+            profileSelect.appendChild(option);
+        });
+
+        const newOption = document.createElement("option");
+        newOption.value = NEW_PROFILE_VALUE;
+        newOption.textContent = "+ New profile...";
+        profileSelect.appendChild(newOption);
+
+        const target = selectAfterLoad !== undefined ? selectAfterLoad : activeProfile;
+        if (target && users.some(u => u.name === target)) {
+            profileSelect.value = target;
+        } else {
+            profileSelect.value = "";
+            activeProfile = "";
+            localStorage.removeItem("pronunciation_profile");
+        }
+        updateProfileStatus();
+    } catch (error) {
+        console.error("Failed to load profiles:", error);
+    }
+}
+
+function updateProfileStatus() {
+    profileStatus.textContent = activeProfile ? `Practicing as "${activeProfile}"` : "";
+}
+
+profileSelect.onchange = async () => {
+    const value = profileSelect.value;
+
+    if (value === NEW_PROFILE_VALUE) {
+        const name = prompt("Enter a name for your new profile:");
+        if (!name || !name.trim()) {
+            profileSelect.value = activeProfile;
+            return;
+        }
+        try {
+            const response = await fetch("/users", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: name.trim() }),
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                alert(data.error || "Could not create profile.");
+                profileSelect.value = activeProfile;
+                return;
+            }
+            activeProfile = data.name;
+            localStorage.setItem("pronunciation_profile", activeProfile);
+            await loadProfiles(activeProfile);
+        } catch (error) {
+            alert("Request failed: " + error.message);
+            profileSelect.value = activeProfile;
+        }
+        return;
+    }
+
+    activeProfile = value;
+    if (activeProfile) {
+        localStorage.setItem("pronunciation_profile", activeProfile);
+    } else {
+        localStorage.removeItem("pronunciation_profile");
+    }
+    updateProfileStatus();
+};
+
+loadProfiles();
+
+// -----------------------------
+// Tabs
+// -----------------------------
+const tabButtons = document.querySelectorAll(".tab-button");
+const practiceWrapper = document.getElementById("practiceWrapper");
+const adaptivePanel = document.getElementById("adaptivePanel");
+const progressPanel = document.getElementById("progressPanel");
+const textInput = document.getElementById("textInput");
+
+tabButtons.forEach(button => {
+    button.onclick = () => {
+        tabButtons.forEach(b => b.classList.remove("active"));
+        button.classList.add("active");
+        const tab = button.dataset.tab;
+
+        practiceWrapper.classList.toggle("hidden", tab === "progress");
+        adaptivePanel.classList.toggle("hidden", tab !== "adaptive");
+        progressPanel.classList.toggle("hidden", tab !== "progress");
+
+        if (tab === "free") {
+            currentSentenceId = null;
+        }
+        if (tab === "progress") {
+            loadProgress();
+        }
+    };
+});
+
+textInput.addEventListener("input", () => {
+    // Manual edits invalidate the link to whichever exercise was served --
+    // otherwise a re-typed sentence would be silently credited to the
+    // original adaptive exercise's assignment.
+    currentSentenceId = null;
+});
+
+// -----------------------------
+// Adaptive practice
+// -----------------------------
+const nextExerciseBtn = document.getElementById("nextExerciseBtn");
+const adaptiveStatus = document.getElementById("adaptiveStatus");
+const adaptiveExerciseInfo = document.getElementById("adaptiveExerciseInfo");
+const adaptiveMode = document.getElementById("adaptiveMode");
+const adaptiveTargets = document.getElementById("adaptiveTargets");
+
+nextExerciseBtn.onclick = async () => {
+    if (!activeProfile) {
+        alert("Select or create a profile first.");
+        return;
+    }
+
+    adaptiveStatus.textContent = "Fetching your next exercise...";
+    adaptiveExerciseInfo.classList.add("hidden");
+
+    try {
+        const response = await fetch(`/practice/next?user=${encodeURIComponent(activeProfile)}`);
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+            adaptiveStatus.textContent = data.error || "Could not fetch an exercise.";
+            return;
+        }
+
+        textInput.value = data.text;
+        currentSentenceId = data.sentence_id;
+
+        adaptiveMode.textContent = describeMode(data.mode);
+        adaptiveTargets.innerHTML = "";
+        (data.target_phonemes || []).forEach(phoneme => {
+            const badge = document.createElement("span");
+            badge.className = "phoneme-badge";
+            badge.textContent = phoneme;
+            adaptiveTargets.appendChild(badge);
+        });
+        if (!data.target_phonemes || data.target_phonemes.length === 0) {
+            adaptiveTargets.innerHTML = "<em>broad warm-up (no history yet)</em>";
+        }
+
+        adaptiveExerciseInfo.classList.remove("hidden");
+        adaptiveStatus.textContent = "Record yourself reading the sentence above, then click Analyze.";
+
+        document.getElementById("results").classList.add("hidden");
+        recordedBlob = null;
+        analyzeBtn.disabled = true;
+    } catch (error) {
+        adaptiveStatus.textContent = "Request failed: " + error.message;
+    }
+};
+
+function describeMode(mode) {
+    if (mode === "diagnostic") return "Diagnostic (broad warm-up, not enough history yet)";
+    if (mode === "generated") return "Freshly generated for your weak sounds";
+    return "Targeted at your weakest sounds";
+}
+
+// -----------------------------
+// Progress
+// -----------------------------
+const refreshProgressBtn = document.getElementById("refreshProgressBtn");
+const progressStatus = document.getElementById("progressStatus");
+const progressList = document.getElementById("progressList");
+const historyList = document.getElementById("historyList");
+
+refreshProgressBtn.onclick = loadProgress;
+
+async function loadProgress() {
+    if (!activeProfile) {
+        progressStatus.textContent = "Select a profile above to see your per-phoneme progress.";
+        progressList.innerHTML = "";
+        historyList.innerHTML = "";
+        return;
+    }
+
+    progressStatus.textContent = "Loading...";
+
+    try {
+        const [gapsResponse, historyResponse] = await Promise.all([
+            fetch(`/practice/gaps?user=${encodeURIComponent(activeProfile)}`),
+            fetch(`/practice/history?user=${encodeURIComponent(activeProfile)}`),
+        ]);
+        const gapsData = await gapsResponse.json();
+        const historyData = await historyResponse.json();
+
+        renderProgressList(gapsData.phonemes || []);
+        renderHistoryList(historyData.attempts || []);
+
+        progressStatus.textContent = (gapsData.phonemes || []).length
+            ? `Showing ${gapsData.phonemes.length} tracked phoneme(s) for "${activeProfile}", weakest first.`
+            : `No attempts recorded yet for "${activeProfile}". Try Adaptive Practice or Free Practice with a profile selected.`;
+    } catch (error) {
+        progressStatus.textContent = "Request failed: " + error.message;
+    }
+}
+
+function renderProgressList(phonemes) {
+    progressList.innerHTML = "";
+    phonemes.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "progress-row";
+
+        const masteryPercent = Math.round(item.mastery * 100);
+        const isWeak = item.lower_confidence_bound < 0.5;
+
+        row.innerHTML = `
+            <span class="progress-symbol">${escapeHtml(item.phoneme)}</span>
+            <span class="progress-bar-track">
+                <span class="progress-bar-fill ${isWeak ? "weak" : ""}" style="width: ${masteryPercent}%;"></span>
+            </span>
+            <span>${masteryPercent}%</span>
+            <span class="progress-meta">${item.attempts_count} attempt(s)${item.example ? " &middot; e.g. " + escapeHtml(item.example) : ""}</span>
+        `;
+        progressList.appendChild(row);
+    });
+}
+
+function renderHistoryList(attempts) {
+    historyList.innerHTML = "";
+    if (!attempts.length) {
+        historyList.innerHTML = "<p class=\"empty-guide\">No attempts yet.</p>";
+        return;
+    }
+    attempts.forEach(attempt => {
+        const row = document.createElement("div");
+        row.className = "history-row";
+        row.innerHTML = `
+            <span class="history-text">${escapeHtml(attempt.text)}</span>
+            <span class="history-meta">PER ${attempt.phoneme_error_rate}% &middot; ${escapeHtml(attempt.created_at)}</span>
+        `;
+        historyList.appendChild(row);
+    });
 }

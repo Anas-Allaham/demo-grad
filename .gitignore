@@ -2,3 +2,7 @@ model/my_wav2vec2_phoneme_model/model.safetensors
 uploads/
 __pycache__/
 *.pyc
+app.db
+app.db-wal
+app.db-shm
+.env

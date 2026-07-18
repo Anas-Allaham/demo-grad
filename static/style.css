@@ -283,3 +283,144 @@ th {
 .empty-guide {
     color: #64748b;
 }
+
+/* Profile bar */
+.profile-bar {
+    padding: 18px 22px;
+    margin-bottom: 18px;
+}
+
+.profile-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.profile-label {
+    margin: 0;
+}
+
+.profile-row select {
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid #cbd5e1;
+    font-size: 15px;
+    min-width: 220px;
+}
+
+.profile-status {
+    color: #64748b;
+    font-weight: 700;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+}
+
+.tab-button {
+    background: white;
+    color: #1d3557;
+    box-shadow: 0 6px 18px rgba(31, 41, 55, 0.08);
+}
+
+.tab-button.active {
+    background: #1d3557;
+    color: white;
+}
+
+/* Adaptive practice panel */
+.adaptive-panel,
+#progressPanel {
+    padding: 22px;
+    margin-bottom: 18px;
+}
+
+.adaptive-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.adaptive-header h3 {
+    margin: 0;
+}
+
+.phoneme-badges {
+    display: inline-flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.phoneme-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: #e0e7ff;
+    color: #1d3557;
+    font-weight: 800;
+    font-size: 16px;
+}
+
+/* Progress list */
+.progress-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 90px 110px;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.progress-symbol {
+    font-size: 20px;
+    font-weight: 800;
+    color: #1d3557;
+}
+
+.progress-bar-track {
+    background: #e5e7eb;
+    border-radius: 999px;
+    height: 12px;
+    overflow: hidden;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    background: #1d3557;
+    border-radius: 999px;
+}
+
+.progress-bar-fill.weak {
+    background: #c2410c;
+}
+
+.progress-meta {
+    color: #64748b;
+    font-size: 13px;
+    text-align: right;
+}
+
+.history-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.history-row .history-text {
+    flex: 1;
+}
+
+.history-row .history-meta {
+    color: #64748b;
+    white-space: nowrap;
+}

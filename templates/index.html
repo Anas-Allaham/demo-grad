@@ -18,6 +18,49 @@
             </div>
         </section>
 
+        <section class="card profile-bar">
+            <div class="profile-row">
+                <label for="profileSelect" class="profile-label">Profile</label>
+                <select id="profileSelect">
+                    <option value="">No profile (Free Practice only)</option>
+                </select>
+                <span id="profileStatus" class="profile-status"></span>
+            </div>
+        </section>
+
+        <nav class="tabs">
+            <button type="button" class="tab-button active" data-tab="free">Free Practice</button>
+            <button type="button" class="tab-button" data-tab="adaptive">Adaptive Practice</button>
+            <button type="button" class="tab-button" data-tab="progress">My Progress</button>
+        </nav>
+
+        <section id="adaptivePanel" class="card adaptive-panel hidden">
+            <div class="adaptive-header">
+                <div>
+                    <h3>Adaptive Practice</h3>
+                    <p class="guide-subtitle">Generates a sentence targeting the phonemes you struggle with most, based on your history.</p>
+                </div>
+                <button id="nextExerciseBtn" type="button">Get Next Exercise</button>
+            </div>
+            <div id="adaptiveExerciseInfo" class="hidden">
+                <p><strong>Mode:</strong> <span id="adaptiveMode"></span></p>
+                <p><strong>Target sounds:</strong> <span id="adaptiveTargets" class="phoneme-badges"></span></p>
+            </div>
+            <p id="adaptiveStatus" class="status">Select a profile above, then click "Get Next Exercise".</p>
+        </section>
+
+        <section id="progressPanel" class="card hidden">
+            <div class="adaptive-header">
+                <h3>My Progress</h3>
+                <button id="refreshProgressBtn" type="button" class="secondary-button">Refresh</button>
+            </div>
+            <p id="progressStatus" class="status">Select a profile above to see your per-phoneme progress.</p>
+            <div id="progressList"></div>
+            <h4 class="table-title">Recent Attempts</h4>
+            <div id="historyList"></div>
+        </section>
+
+        <section id="practiceWrapper">
         <section class="card input-card">
             <label for="textInput">Sentence</label>
             <textarea id="textInput" placeholder="Example: school is open"></textarea>
@@ -105,6 +148,7 @@
                     <tbody id="alignmentTable"></tbody>
                 </table>
             </div>
+        </section>
         </section>
     </main>
 

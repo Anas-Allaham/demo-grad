@@ -9,3 +9,14 @@ panphon
 spacy
 nemo_toolkit[tts]
 matplotlib
+scipy
+python-dotenv
+
+# Optional: only needed for the LLM-generation fallback in content.py
+# (used when the offline sentence bank has no good match for a user's
+# weak phonemes). Talks to an LLM over an OpenAI-compatible endpoint, so
+# the `openai` client library is what's required. Defaults to Google AI
+# Studio (Gemini): set GEMINI_API_KEY to enable it. Point LLM_BASE_URL +
+# EXERCISE_LLM_MODEL elsewhere (e.g. Qwen) to switch providers. Without a
+# key the app runs retrieval-only.
+openai

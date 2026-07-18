@@ -5,6 +5,7 @@ import uuid
 import unicodedata
 import subprocess
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 try:
@@ -17,11 +18,24 @@ try:
 except Exception:
     sf = None
 
+# Load .env (API keys, LLM config) BEFORE importing content, so its
+# module-level configuration picks up any overrides from the file.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass  # python-dotenv is optional; env vars set in the shell still work
+
 from phoneme_vectors import canonicalize_phoneme, phoneme_distance, substitution_label, panphon_available
 import librosa
 import torch
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+import content
+import db
+import mastery
+import services
 
 app = Flask(__name__)
 
@@ -34,6 +48,7 @@ IPA_DICT_PATH = G2P_DIR / "cmudict-0.7b-ipa.txt"
 VOICE_FILTERING_DIR = BASE_DIR / "voice-filtering"
 
 UPLOAD_FOLDER.mkdir(exist_ok=True)
+db.init_db()
 
 if str(VOICE_FILTERING_DIR) not in sys.path:
     sys.path.insert(0, str(VOICE_FILTERING_DIR))
@@ -712,6 +727,87 @@ def calculate_metrics(operations: List[str], distances: List[float] | None = Non
     }
 
 # -----------------------------
+# Adaptive practice: profile <-> mastery-model bridging helpers
+# -----------------------------
+def _parse_db_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse a stored timestamp back into an aware UTC datetime -- every
+    PhonemeStat.last_practiced_at that reaches mastery.py must be
+    consistently tz-aware, since fresh ones are created with
+    `datetime.now(timezone.utc)` and naive/aware datetimes can't be
+    subtracted from each other."""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _format_db_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _load_phoneme_stats(user_id: int) -> Dict[str, "mastery.PhonemeStat"]:
+    stats = {}
+    for row in db.get_all_phoneme_states(user_id):
+        stats[row["phoneme"]] = mastery.PhonemeStat(
+            alpha=row["alpha"],
+            beta=row["beta"],
+            attempts_count=row["attempts_count"],
+            last_practiced_at=_parse_db_datetime(row["last_practiced_at"]),
+        )
+    return stats
+
+
+def _persist_phoneme_stats(user_id: int, stats: Dict[str, "mastery.PhonemeStat"]) -> None:
+    for phoneme, stat in stats.items():
+        db.upsert_phoneme_state(
+            user_id=user_id,
+            phoneme=phoneme,
+            alpha=stat.alpha,
+            beta=stat.beta,
+            attempts_count=stat.attempts_count,
+            last_practiced_at=_format_db_datetime(stat.last_practiced_at or datetime.now(timezone.utc)),
+        )
+
+
+def _record_attempt_for_user(
+    user_id: int,
+    user_text: str,
+    reference_ipa: str,
+    predicted_ipa: str,
+    metrics: Dict[str, Any],
+    alignment: List[Dict[str, Any]],
+    exercise_id: Optional[int],
+) -> int:
+    """Persist one /analyze attempt for a named profile and fold its
+    alignment into that profile's per-phoneme mastery state. Returns the
+    new attempt id."""
+    attempt_id = db.record_attempt(
+        user_id=user_id,
+        text=user_text,
+        reference_ipa=reference_ipa,
+        predicted_ipa=predicted_ipa,
+        phoneme_error_rate=metrics["phoneme_error_rate"],
+        weighted_error=metrics["weighted_error"],
+        exercise_id=exercise_id,
+    )
+    db.record_phoneme_events(attempt_id, alignment)
+
+    now = datetime.now(timezone.utc)
+    stats = _load_phoneme_stats(user_id)
+    updated_stats = mastery.update_mastery_for_attempt(stats, alignment, now)
+    _persist_phoneme_stats(user_id, updated_stats)
+
+    if exercise_id is not None:
+        db.complete_latest_assignment(user_id, exercise_id, attempt_id)
+
+    return attempt_id
+
+
+# -----------------------------
 # Routes
 # -----------------------------
 @app.route("/")
@@ -759,6 +855,9 @@ def g2p_route():
 def analyze():
     try:
         user_text = request.form.get("text", "").strip()
+        profile_name = request.form.get("user", "").strip()
+        sentence_id_raw = request.form.get("sentence_id", "").strip()
+        sentence_id = int(sentence_id_raw) if sentence_id_raw.isdigit() else None
 
         if not user_text:
             return jsonify({"error": "Please enter text first."}), 400
@@ -798,6 +897,25 @@ def analyze():
             "distance": dist,
             })
 
+        profile = None
+        if profile_name:
+            user_row = db.get_or_create_user(profile_name)
+            # A stale/bogus sentence_id from the client shouldn't be able to
+            # sink an otherwise-successful analysis (FK constraint would
+            # reject the attempt insert) -- verify it references a real
+            # bank entry first, and just drop the link if not.
+            valid_sentence_id = sentence_id if sentence_id is not None and db.get_sentence_by_id(sentence_id) is not None else None
+            _record_attempt_for_user(
+                user_id=user_row["id"],
+                user_text=user_text,
+                reference_ipa=reference_ipa,
+                predicted_ipa=predicted_ipa,
+                metrics=metrics,
+                alignment=alignment,
+                exercise_id=valid_sentence_id,
+            )
+            profile = {"id": user_row["id"], "name": user_row["name"]}
+
         return jsonify({
             "text": user_text,
             "reference_ipa": reference_ipa,
@@ -812,6 +930,7 @@ def analyze():
             "reduced_audio_url": reduced_audio_url,
             "alignment": alignment,
             "metrics": metrics,
+            "profile": profile,
         })
 
     except Exception as e:
@@ -820,6 +939,201 @@ def analyze():
         traceback.print_exc()
         print("================================\n")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/users", methods=["GET", "POST"])
+def users_route():
+    """No auth: a 'user' is just a name. POST resolves-or-creates a profile
+    by name; GET lists existing profiles for a picker dropdown."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or request.form
+        name = str(data.get("name", "")).strip()
+        if not name:
+            return jsonify({"error": "Please provide a name."}), 400
+        user_row = db.get_or_create_user(name)
+        return jsonify({"id": user_row["id"], "name": user_row["name"]})
+
+    return jsonify([{"id": row["id"], "name": row["name"]} for row in db.list_users()])
+
+
+@app.route("/practice/next")
+def practice_next():
+    try:
+        profile_name = request.args.get("user", "").strip()
+        if not profile_name:
+            return jsonify({"error": "Please provide a user name."}), 400
+
+        user_row = db.get_or_create_user(profile_name)
+        user_id = user_row["id"]
+
+        stats = _load_phoneme_stats(user_id)
+        target_phonemes = mastery.rank_weak_phonemes(stats)
+        recently_served = db.get_recently_served_sentence_ids(user_id)
+
+        mode = "targeted"
+        chosen = None
+
+        if not target_phonemes:
+            mode = "diagnostic"
+            chosen = content.pick_diagnostic_sentence(db.get_all_sentences(), recently_served)
+        else:
+            overmastered = mastery.get_overmastered_phonemes(stats)
+            candidates = db.get_sentences_covering_any(target_phonemes)
+            best = content.pick_next_sentence(candidates, target_phonemes, overmastered, recently_served)
+
+            required_overlap = (len(target_phonemes) + 1) // 2  # ceil(n / 2)
+            best_overlap = 0 if best is None else sum(1 for p in target_phonemes if p in best["phoneme_counts"])
+
+            if best_overlap < required_overlap:
+                generated = content.generate_and_verify_exercise(
+                    target_phonemes, overmastered, content.TARGET_WORD_COUNT, g2p_convert, ipa_to_tokens
+                )
+                if generated is not None:
+                    new_id = db.insert_sentence(
+                        text=generated["text"],
+                        reference_ipa=generated["reference_ipa"],
+                        word_count=generated["word_count"],
+                        level_proxy=generated["level_proxy"],
+                        phoneme_counts=generated["phoneme_counts"],
+                        source="llm_generated",
+                    )
+                    if new_id is not None:
+                        generated["id"] = new_id
+                        best = generated
+                        mode = "generated"
+
+            if best is None:
+                mode = "diagnostic"
+                chosen = content.pick_diagnostic_sentence(db.get_all_sentences(), recently_served)
+            else:
+                chosen = best
+
+        if chosen is None:
+            return jsonify({
+                "error": "No practice sentences are available yet. Run scripts/build_exercise_bank.py first."
+            }), 503
+
+        db.record_practice_assignment(user_id, chosen["id"], target_phonemes)
+
+        return jsonify({
+            "sentence_id": chosen["id"],
+            "text": chosen["text"],
+            "reference_ipa": chosen["reference_ipa"],
+            "reference_guide": ipa_reading_guide(chosen["reference_ipa"]),
+            "target_phonemes": target_phonemes,
+            "mode": mode,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/exercise", methods=["GET", "POST"])
+def exercise_route():
+    """Focused service endpoint: take a user's per-phoneme level metrics and
+    return one suitable exercise.
+
+    Two ways to call it:
+      * GET  /exercise?user=NAME     -> load that profile's stored metrics
+      * POST /exercise {"metrics": {"θ": 0.2, "s": 0.9, ...}}  -> stateless,
+        assess the metrics you pass in directly (no profile needed)
+
+    Response carries both the level assessment and the chosen exercise, so
+    the two steps (assess -> generate) are visible in one call.
+    """
+    try:
+        user_name = None
+        recently_served = set()
+
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            if "metrics" in data:
+                metrics = {str(k): float(v) for k, v in (data.get("metrics") or {}).items()}
+            else:
+                user_name = str(data.get("user", "")).strip()
+                metrics = services.metrics_for_user(user_name) if user_name else {}
+        else:
+            user_name = request.args.get("user", "").strip()
+            if not user_name:
+                return jsonify({"error": "Provide ?user=NAME, or POST a metrics object."}), 400
+            metrics = services.metrics_for_user(user_name)
+
+        if user_name:
+            user_row = db.get_user_by_name(user_name)
+            if user_row is not None:
+                recently_served = db.get_recently_served_sentence_ids(user_row["id"])
+
+        result = services.generate_exercise(metrics, g2p_convert, ipa_to_tokens, recently_served)
+
+        exercise = result.get("exercise")
+        if exercise is None:
+            return jsonify(result), 503
+
+        # Record the assignment so it counts toward this profile's history
+        # and the recently-served rotation on the next call.
+        if user_name:
+            user_row = db.get_or_create_user(user_name)
+            db.record_practice_assignment(user_row["id"], exercise["sentence_id"], result["target_phonemes"])
+
+        exercise["reference_guide"] = ipa_reading_guide(exercise["reference_ipa"])
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/practice/gaps")
+def practice_gaps():
+    profile_name = request.args.get("user", "").strip()
+    if not profile_name:
+        return jsonify({"error": "Please provide a user name."}), 400
+
+    user_row = db.get_user_by_name(profile_name)
+    if user_row is None:
+        return jsonify({"phonemes": []})
+
+    stats = _load_phoneme_stats(user_row["id"])
+    ranked = sorted(stats.items(), key=lambda pair: mastery.lower_confidence_bound(pair[1]))
+
+    phonemes = []
+    for phoneme, stat in ranked:
+        guide = PHONEME_GUIDE.get(phoneme, {})
+        phonemes.append({
+            "phoneme": phoneme,
+            "mastery": round(mastery.posterior_mean(stat), 3),
+            "lower_confidence_bound": round(mastery.lower_confidence_bound(stat), 3),
+            "attempts_count": stat.attempts_count,
+            "last_practiced_at": stat.last_practiced_at.isoformat() if stat.last_practiced_at else None,
+            "example": guide.get("example", ""),
+        })
+
+    return jsonify({"phonemes": phonemes})
+
+
+@app.route("/practice/history")
+def practice_history():
+    profile_name = request.args.get("user", "").strip()
+    if not profile_name:
+        return jsonify({"error": "Please provide a user name."}), 400
+
+    user_row = db.get_user_by_name(profile_name)
+    if user_row is None:
+        return jsonify({"attempts": []})
+
+    rows = db.get_user_attempts(user_row["id"], limit=20)
+    return jsonify({
+        "attempts": [
+            {
+                "id": row["id"],
+                "text": row["text"],
+                "phoneme_error_rate": row["phoneme_error_rate"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+    })
 
 
 if __name__ == "__main__":
