@@ -27,7 +27,8 @@ def reduce_noise(audio_array, sr, noise_clip=None, use_noisereduce=True):
     If noise_clip is provided, it will use it as the noise profile.
     """
     if use_noisereduce and NOISEREDUCE_AVAILABLE:
-        filtered_audio = nr.reduce_noise(y=audio_array, sr=sr, y_noise=noise_clip, prop_decrease=1.0)
+        print('used reducer')
+        filtered_audio = nr.reduce_noise(y=audio_array, sr=sr)
         return filtered_audio
     else:
         # If noisereduce is unavailable or disabled, return original
