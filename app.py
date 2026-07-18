@@ -66,9 +66,12 @@ from g2p_service import (
 )
 from phoneme_vectors_professional import (
     canonical_inventory,
+    canonicalize_phoneme,
     panphon_available,
     scoring_engine,
+    scoring_trusted,
     validate_g2p_inventory,
+    validate_panphon_inventory,
 )
 from scoring import align_phonemes, calculate_metrics, to_api_alignment
 from tokenization import (
@@ -90,6 +93,12 @@ VOICE_FILTERING_DIR = BASE_DIR / "voice-filtering"
 # engine are never folded into trusted mastery -- they're clearly a degraded
 # state, not "professional" substitution scores.
 MASTERY_REQUIRES_PANPHON = True
+
+# Recordings are PRIVATE and TEMPORARY by default: the original upload, the
+# converted WAV, and the noise-reduced WAV are all deleted after processing.
+# Set RETAIN_AUDIO=1 (env) only if you explicitly want to keep them (e.g. to
+# offer noise-reduced playback). Never enable this for shared/production use.
+RETAIN_AUDIO = os.environ.get("RETAIN_AUDIO", "0") == "1"
 
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 db.init_db()
@@ -174,11 +183,26 @@ def _apply_noise_reduction(wav_path: Path, reduced_path: Path):
     return wav_path, applied, pipeline
 
 
+def _cleanup_audio_files(paths: List[Optional[Path]]) -> None:
+    """Delete temporary recording files (original, converted, reduced) unless
+    retention is explicitly enabled. Recordings are private by default."""
+    if RETAIN_AUDIO:
+        return
+    for path in paths:
+        try:
+            if path is not None and Path(path).exists():
+                Path(path).unlink()
+        except Exception as exc:
+            print("Could not delete temporary audio:", repr(exc))
+
+
 def process_recording(audio_path: Path) -> Dict[str, Any]:
     """Convert -> quality-gate -> (if scorable) noise-reduce -> transcribe.
 
     If the audio-quality gate rejects the recording, transcription is skipped
     entirely and ``predicted_ipa`` is None -- the caller must not score it.
+    ``cleanup_paths`` lists every on-disk artifact this produced so the caller
+    can delete them after processing (private/temporary by default).
     """
     wav_path = convert_audio_to_wav(audio_path)
     raw_audio, sr = librosa.load(str(wav_path), sr=16000, mono=True)
@@ -190,6 +214,7 @@ def process_recording(audio_path: Path) -> Dict[str, Any]:
         "reduced_audio_path": None,
         "noise_reduction_applied": False,
         "preprocessing_pipeline": "not_processed",
+        "cleanup_paths": [audio_path, wav_path],
     }
     if not decision.scorable:
         return result  # gate: do not transcribe or score an unscorable recording
@@ -199,6 +224,7 @@ def process_recording(audio_path: Path) -> Dict[str, Any]:
     result["noise_reduction_applied"] = applied
     result["preprocessing_pipeline"] = pipeline
     result["reduced_audio_path"] = reduced_path if reduced_path.exists() else None
+    result["cleanup_paths"].append(reduced_path)
 
     load_wav2vec_model()
     model_audio, _ = librosa.load(str(model_input_path), sr=16000, mono=True)
@@ -226,6 +252,16 @@ def _persist_phoneme_stats(user_id: int, stats: Dict[str, "mastery.PhonemeStat"]
         )
 
 
+def _stat_to_row(stat: "mastery.PhonemeStat") -> Dict[str, Any]:
+    return {
+        "alpha": stat.alpha,
+        "beta": stat.beta,
+        "attempts_count": stat.independent_attempts,
+        "occurrence_count": stat.occurrence_count,
+        "last_practiced_at": format_db_datetime(stat.last_practiced_at or datetime.now(timezone.utc)),
+    }
+
+
 def _record_recording(
     user_id: int,
     user_text: str,
@@ -235,46 +271,77 @@ def _record_recording(
     alignment: List[Dict[str, Any]],
     quality_decision: AudioQualityDecision,
     exercise_id: Optional[int],
-    scoring_trusted: bool,
+    engine_trusted: bool,
+    engine_name: str,
 ) -> Dict[str, Any]:
-    """Persist one scorable recording, and update mastery ONLY when scoring is
-    trusted (PanPhon-backed). Returns {attempt_id, mastery_updated}."""
-    attempt_id = db.record_attempt(
-        user_id=user_id,
-        text=user_text,
-        reference_ipa=reference_ipa,
-        predicted_ipa=predicted_ipa,
-        phoneme_error_rate=metrics["phoneme_error_rate"],
-        weighted_error=metrics["weighted_error"],
-        exercise_id=exercise_id,
-        raw_weighted_per=metrics["raw_weighted_per"],
-        quality_weight=quality_decision.quality_weight,
-        scorable=True,
-    )
-    db.record_phoneme_events(attempt_id, alignment)
+    """Persist one scorable recording as a SINGLE atomic transaction (attempt +
+    events + mastery + assignment completion). Mastery is updated ONLY when the
+    scoring engine is trusted; audio quality is applied as fractional Beta
+    evidence, never as a pronunciation failure. Returns
+    {attempt_id, mastery_updated}."""
+    mastery_updated = should_update_mastery(scorable=True, scoring_trusted=engine_trusted)
 
-    mastery_updated = False
-    if should_update_mastery(scorable=True, scoring_trusted=scoring_trusted):
+    phoneme_states: Optional[Dict[str, Dict[str, Any]]] = None
+    complete_exercise_id: Optional[int] = None
+    if mastery_updated:
         now = datetime.now(timezone.utc)
         stats = services.load_profile_stats(user_id)
-        updated = mastery.update_mastery_for_recording(stats, alignment, now)
-        _persist_phoneme_stats(user_id, updated)
-        mastery_updated = True
-        if exercise_id is not None:
-            db.complete_latest_assignment(user_id, exercise_id, attempt_id)
+        updated = mastery.update_mastery_for_recording(
+            stats, alignment, now, quality_weight=quality_decision.quality_weight
+        )
+        # Persist only the phonemes this recording actually touched.
+        touched = {
+            canonicalize_phoneme(r["expected"])
+            for r in alignment if r.get("expected") not in (None, "-")
+        }
+        phoneme_states = {ph: _stat_to_row(updated[ph]) for ph in touched if ph in updated}
+        complete_exercise_id = exercise_id
 
+    attempt_kwargs = {
+        "text": user_text,
+        "reference_ipa": reference_ipa,
+        "predicted_ipa": predicted_ipa,
+        "phoneme_error_rate": metrics["phoneme_error_rate"],
+        "weighted_error": metrics["weighted_error"],
+        "exercise_id": exercise_id,
+        "raw_weighted_per": metrics["raw_weighted_per"],
+        "quality_weight": quality_decision.quality_weight,
+        "scorable": True,
+        "scoring_engine": engine_name,
+        "scoring_trusted": engine_trusted,
+        "mastery_updated": mastery_updated,
+        "insertion_count": metrics.get("insertion_count", metrics.get("insertions", 0)),
+    }
+    attempt_id = db.record_recording_atomic(
+        user_id=user_id,
+        attempt_kwargs=attempt_kwargs,
+        alignment=alignment,
+        scoring_engine=engine_name,
+        phoneme_states=phoneme_states,
+        complete_exercise_id=complete_exercise_id,
+    )
     return {"attempt_id": attempt_id, "mastery_updated": mastery_updated}
 
 
 def validate_startup_inventory() -> Dict[str, Any]:
-    """Check that the phonemes tagged into the exercise bank all map into the
-    canonical scoring inventory; log any that don't. Unsupported phonemes must
-    never silently enter scoring."""
+    """Startup validation: (1) every tagged bank phoneme maps into the canonical
+    inventory, and (2) PanPhon can vectorize every assessable phoneme. Both are
+    logged; neither is allowed to silently degrade into untrusted scoring."""
     bank_phonemes = db.get_all_bank_phonemes()
     report = validate_g2p_inventory(bank_phonemes)
     if not report["ok"]:
         print("WARNING: exercise-bank phonemes outside canonical inventory:", report["unsupported"])
-    return report
+
+    panphon_report = validate_panphon_inventory()
+    if not panphon_available():
+        print("NOTE: PanPhon not installed -- scoring runs in the untrusted "
+              "fallback_features mode; mastery will NOT be updated.")
+    elif not panphon_report["ok"]:
+        print("WARNING: PanPhon is installed but cannot vectorize:",
+              panphon_report["failures"], "-- scoring is UNTRUSTED (fallback_features).")
+    else:
+        print("PanPhon validated: all assessable phonemes vectorize -- scoring engine is TRUSTED.")
+    return {"inventory": report, "panphon": panphon_report}
 
 
 # -----------------------------
@@ -311,7 +378,8 @@ def health():
 
     inventory_report = validate_g2p_inventory(db.get_all_bank_phonemes())
     bank_count = db.count_exercise_bank()
-    panphon_ok = panphon_available()
+    panphon_report = validate_panphon_inventory()
+    engine_trusted = scoring_trusted()
 
     ready = bool(model_config_present and weight_present and inventory_report["ok"] and bank_count > 0)
 
@@ -323,9 +391,11 @@ def health():
         "model_weight_present": weight_present,
         "processor_loadable": processor_loadable,
         "model_loadable": model_loadable,
-        "panphon_available": panphon_ok,
+        "panphon_available": panphon_available(),
+        "panphon_inventory_ok": panphon_report["ok"],
+        "panphon_inventory_failures": panphon_report["failures"],
         "scoring_engine": scoring_engine(),
-        "scoring_trusted": panphon_ok,
+        "scoring_trusted": engine_trusted,
         "g2p_available": HETERONYMS_PATH.exists() and IPA_DICT_PATH.exists(),
         "g2p_mode": get_g2p_mode(),
         "exercise_bank_count": bank_count,
@@ -334,6 +404,7 @@ def health():
         "canonical_inventory_ok": inventory_report["ok"],
         "canonical_inventory_unsupported": inventory_report["unsupported"],
         "audio_filter_safe_available": safe_process_audio_file is not None,
+        "audio_retention_enabled": RETAIN_AUDIO,
     })
 
 
@@ -378,79 +449,93 @@ def analyze():
         reference_ipa = g2p_convert(user_text)
         recording = process_recording(audio_path)
         decision: AudioQualityDecision = recording["quality_decision"]
+        cleanup_paths = recording.get("cleanup_paths", [audio_path])
 
-        user_row = db.get_or_create_user(profile_name) if profile_name else None
+        engine_name = scoring_engine()
+        engine_trusted = scoring_trusted() or not MASTERY_REQUIRES_PANPHON
 
-        # ---- Audio-quality gate: reject unscorable recordings ----
-        if not decision.scorable:
+        try:
+            user_row = db.get_or_create_user(profile_name) if profile_name else None
+
+            # ---- Audio-quality gate: reject unscorable recordings ----
+            if not decision.scorable:
+                if user_row is not None:
+                    # Store the rejected attempt (no events, no mastery, untrusted).
+                    db.record_attempt(
+                        user_id=user_row["id"], text=user_text, reference_ipa=reference_ipa,
+                        predicted_ipa="", phoneme_error_rate=0.0, weighted_error=0.0,
+                        quality_weight=decision.quality_weight, scorable=False,
+                        rejected_reason=",".join(decision.reasons),
+                        scoring_engine=engine_name, scoring_trusted=False, mastery_updated=False,
+                    )
+                return jsonify({
+                    "scorable": False,
+                    "audio_quality": decision.to_dict(),
+                    "message": "That recording could not be scored. Please record again "
+                               "(check your mic, avoid clipping, and speak the full sentence).",
+                    "reference_ipa": reference_ipa,
+                    "reference_guide": ipa_reading_guide(reference_ipa),
+                    "profile": ({"id": user_row["id"], "name": user_row["name"]} if user_row else None),
+                })
+
+            predicted_ipa = recording["predicted_ipa"]
+            reduced_audio_path = recording["reduced_audio_path"]
+            # Reduced-audio playback is only offered when retention is enabled;
+            # otherwise the file is deleted below and there is nothing to serve.
+            reduced_audio_url = (
+                f"/uploads/{reduced_audio_path.name}"
+                if (reduced_audio_path and RETAIN_AUDIO) else None
+            )
+
+            ref_seq = tokenize_reference_ipa(reference_ipa)
+            hyp_seq = tokenize_ctc_prediction(predicted_ipa)
+            rows = align_phonemes(ref_seq, hyp_seq)
+            metrics = calculate_metrics(rows)
+            api_alignment = to_api_alignment(rows)
+
+            profile = None
+            mastery_updated = False
             if user_row is not None:
-                # Optionally store the rejected attempt (no events, no mastery).
-                db.record_attempt(
-                    user_id=user_row["id"], text=user_text, reference_ipa=reference_ipa,
-                    predicted_ipa="", phoneme_error_rate=0.0, weighted_error=0.0,
-                    quality_weight=decision.quality_weight, scorable=False,
-                    rejected_reason=",".join(decision.reasons),
+                valid_sentence_id = (
+                    sentence_id if sentence_id is not None and db.get_sentence_by_id(sentence_id) is not None else None
                 )
+                record = _record_recording(
+                    user_id=user_row["id"], user_text=user_text, reference_ipa=reference_ipa,
+                    predicted_ipa=predicted_ipa, metrics=metrics, alignment=rows,
+                    quality_decision=decision, exercise_id=valid_sentence_id,
+                    engine_trusted=engine_trusted, engine_name=engine_name,
+                )
+                mastery_updated = record["mastery_updated"]
+                profile = {"id": user_row["id"], "name": user_row["name"]}
+
             return jsonify({
-                "scorable": False,
-                "audio_quality": decision.to_dict(),
-                "message": "That recording could not be scored. Please record again "
-                           "(check your mic, avoid clipping, and speak the full sentence).",
+                "scorable": True,
+                "text": user_text,
                 "reference_ipa": reference_ipa,
+                "predicted_ipa": predicted_ipa,
                 "reference_guide": ipa_reading_guide(reference_ipa),
-                "profile": ({"id": user_row["id"], "name": user_row["name"]} if user_row else None),
+                "predicted_guide": ipa_reading_guide(predicted_ipa),
+                "g2p_mode": get_g2p_mode(),
+                "scoring_engine": engine_name,
+                "scoring_trusted": engine_trusted,
+                "mastery_updated": mastery_updated,
+                "mastery_note": (
+                    None if engine_trusted else
+                    "PanPhon unavailable or incomplete: showing provisional fallback scores only; "
+                    "mastery was NOT updated."
+                ),
+                "noise_reduction_applied": recording["noise_reduction_applied"],
+                "preprocessing_pipeline": recording["preprocessing_pipeline"],
+                "audio_quality": decision.to_dict(),
+                "reduced_audio_url": reduced_audio_url,
+                "alignment": api_alignment,
+                "metrics": metrics,
+                "profile": profile,
             })
-
-        predicted_ipa = recording["predicted_ipa"]
-        reduced_audio_path = recording["reduced_audio_path"]
-        reduced_audio_url = f"/uploads/{reduced_audio_path.name}" if reduced_audio_path else None
-
-        ref_seq = tokenize_reference_ipa(reference_ipa)
-        hyp_seq = tokenize_ctc_prediction(predicted_ipa)
-        rows = align_phonemes(ref_seq, hyp_seq)
-        metrics = calculate_metrics(rows)
-        api_alignment = to_api_alignment(rows)
-
-        scoring_trusted = panphon_available() or not MASTERY_REQUIRES_PANPHON
-
-        profile = None
-        mastery_updated = False
-        if user_row is not None:
-            valid_sentence_id = (
-                sentence_id if sentence_id is not None and db.get_sentence_by_id(sentence_id) is not None else None
-            )
-            record = _record_recording(
-                user_id=user_row["id"], user_text=user_text, reference_ipa=reference_ipa,
-                predicted_ipa=predicted_ipa, metrics=metrics, alignment=rows,
-                quality_decision=decision, exercise_id=valid_sentence_id,
-                scoring_trusted=scoring_trusted,
-            )
-            mastery_updated = record["mastery_updated"]
-            profile = {"id": user_row["id"], "name": user_row["name"]}
-
-        return jsonify({
-            "scorable": True,
-            "text": user_text,
-            "reference_ipa": reference_ipa,
-            "predicted_ipa": predicted_ipa,
-            "reference_guide": ipa_reading_guide(reference_ipa),
-            "predicted_guide": ipa_reading_guide(predicted_ipa),
-            "g2p_mode": get_g2p_mode(),
-            "scoring_engine": scoring_engine(),
-            "scoring_trusted": scoring_trusted,
-            "mastery_updated": mastery_updated,
-            "mastery_note": (
-                None if scoring_trusted else
-                "PanPhon unavailable: showing provisional fallback scores only; mastery was NOT updated."
-            ),
-            "noise_reduction_applied": recording["noise_reduction_applied"],
-            "preprocessing_pipeline": recording["preprocessing_pipeline"],
-            "audio_quality": decision.to_dict(),
-            "reduced_audio_url": reduced_audio_url,
-            "alignment": api_alignment,
-            "metrics": metrics,
-            "profile": profile,
-        })
+        finally:
+            # Recordings are private and temporary: delete every audio artifact
+            # unless retention is explicitly enabled.
+            _cleanup_audio_files(cleanup_paths)
 
     except Exception as e:
         import traceback
@@ -496,6 +581,7 @@ def practice_next():
         under_observed = diag["uncovered"]
 
         confusion_hint = None
+        confusion_phoneme = None
         exercise_type = "diagnostic"
 
         if diag["in_diagnostic"] or not stats:
@@ -503,24 +589,27 @@ def practice_next():
             targets: List[str] = []
             selection = services.choose_exercise(
                 targets=[], overmastered=overmastered, under_observed=under_observed,
-                overall_level=assessment["overall_level"], confusion_hint=None,
+                overall_level=assessment["overall_level"],
                 recently_served_ids=recently_served, g2p_convert=g2p_convert,
-                ipa_to_tokens=tokenize_reference_ipa, diagnostic=True,
+                ipa_to_tokens=tokenize_reference_ipa, exercise_type="diagnostic", diagnostic=True,
             )
         else:
             targets = mastery.rank_weak_phonemes(stats, now=now)
             top_target = targets[0] if targets else None
-            confusion_hint = services._confusion_hint_for(top_target, confusion_pairs)
+            confusion = assessment_mod.main_confusion_for(top_target, confusion_pairs) if top_target else None
+            if confusion is not None:
+                confusion_phoneme = confusion["spoken"]
+                confusion_hint = f"{confusion['expected']} vs {confusion['spoken']}"
             if top_target is not None:
                 exercise_type = assessment_mod.exercise_type_for_mastery(
-                    mastery.posterior_mean(stats[top_target], now=now)
-                    if top_target in stats else None
+                    mastery.posterior_mean(stats[top_target], now=now) if top_target in stats else None
                 )
             selection = services.choose_exercise(
                 targets=targets, overmastered=overmastered, under_observed=under_observed,
-                overall_level=assessment["overall_level"], confusion_hint=confusion_hint,
+                overall_level=assessment["overall_level"],
                 recently_served_ids=recently_served, g2p_convert=g2p_convert,
-                ipa_to_tokens=tokenize_reference_ipa, diagnostic=False,
+                ipa_to_tokens=tokenize_reference_ipa, exercise_type=exercise_type,
+                top_target=top_target, confusion_phoneme=confusion_phoneme, diagnostic=False,
             )
             mode = selection["source_mode"]
 
@@ -529,12 +618,13 @@ def practice_next():
             gen = selection["generated"]
             new_id = db.insert_sentence(
                 text=gen["text"], reference_ipa=gen["reference_ipa"], word_count=gen["word_count"],
-                level_proxy=gen["level_proxy"], phoneme_counts=gen["phoneme_counts"], source="llm_generated",
+                level_proxy=gen["level_proxy"], phoneme_counts=gen["phoneme_counts"],
+                source=gen.get("source", "llm_generated"),
             )
             if new_id is not None:
                 gen["id"] = new_id
                 chosen = gen
-                mode = "generated"
+                mode = selection["source_mode"]
 
         if chosen is None:
             return jsonify({

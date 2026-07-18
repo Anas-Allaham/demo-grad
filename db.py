@@ -98,18 +98,26 @@ COLUMN_MIGRATIONS: Dict[str, List[tuple]] = {
     "attempt_phoneme_events": [
         ("articulatory_distance", "REAL"),  # raw PanPhon feature distance [0,1]
         ("alignment_cost", "REAL"),         # DP alignment cost (NOT a distance)
+        ("scoring_engine", "TEXT"),         # per-event engine provenance
     ],
     # occurrence_count (phoneme occurrences) is tracked separately from
     # attempts_count, which now means independent recordings.
     "phoneme_skill_state": [
         ("occurrence_count", "INTEGER NOT NULL DEFAULT 0"),
     ],
-    # Richer per-attempt bookkeeping + audio-quality gating.
+    # Richer per-attempt bookkeeping + audio-quality gating + scoring
+    # provenance. scoring_trusted / mastery_updated default to 0 so that
+    # PRE-EXISTING legacy rows are treated as UNTRUSTED unless explicitly
+    # migrated -- assessment/confusion/diagnostic only count trusted rows.
     "attempts": [
         ("raw_weighted_per", "REAL"),
         ("quality_weight", "REAL"),
         ("scorable", "INTEGER NOT NULL DEFAULT 1"),
         ("rejected_reason", "TEXT"),
+        ("scoring_engine", "TEXT"),
+        ("scoring_trusted", "INTEGER NOT NULL DEFAULT 0"),
+        ("mastery_updated", "INTEGER NOT NULL DEFAULT 0"),
+        ("insertion_count", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 
@@ -211,6 +219,19 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     migrate(conn)
 
 
+def set_database_for_testing(path: "str | Path") -> None:
+    """Point the module at a different SQLite file (tests use a temp DB so they
+    never touch the real app.db). Closes any open connection first."""
+    global _connection, DB_PATH
+    if _connection is not None:
+        try:
+            _connection.close()
+        except Exception:
+            pass
+    _connection = None
+    DB_PATH = Path(path)
+
+
 # -----------------------------
 # Users — no auth, just a named profile. get_or_create_user is the only
 # entry point most callers need; a name typed into the UI either resolves
@@ -245,7 +266,8 @@ def list_users(conn: Optional[sqlite3.Connection] = None) -> List[sqlite3.Row]:
 # -----------------------------
 # Attempts + raw phoneme events
 # -----------------------------
-def record_attempt(
+def _insert_attempt(
+    conn: sqlite3.Connection,
     user_id: int,
     text: str,
     reference_ipa: str,
@@ -257,23 +279,37 @@ def record_attempt(
     quality_weight: Optional[float] = None,
     scorable: bool = True,
     rejected_reason: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    scoring_engine: Optional[str] = None,
+    scoring_trusted: bool = False,
+    mastery_updated: bool = False,
+    insertion_count: int = 0,
 ) -> int:
-    conn = conn or get_connection()
+    """Insert one attempt row WITHOUT committing (transaction-friendly)."""
     cur = conn.execute(
         """INSERT INTO attempts
            (user_id, exercise_id, text, reference_ipa, predicted_ipa,
             phoneme_error_rate, weighted_error, raw_weighted_per,
-            quality_weight, scorable, rejected_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            quality_weight, scorable, rejected_reason,
+            scoring_engine, scoring_trusted, mastery_updated, insertion_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             user_id, exercise_id, text, reference_ipa, predicted_ipa,
             phoneme_error_rate, weighted_error, raw_weighted_per,
             quality_weight, 1 if scorable else 0, rejected_reason,
+            scoring_engine, 1 if scoring_trusted else 0,
+            1 if mastery_updated else 0, insertion_count,
         ),
     )
-    conn.commit()
     return cur.lastrowid
+
+
+def record_attempt(conn: Optional[sqlite3.Connection] = None, **kwargs) -> int:
+    """Insert one attempt and commit. Prefer ``record_recording_atomic`` for
+    the full attempt+events+mastery+assignment write."""
+    conn = conn or get_connection()
+    attempt_id = _insert_attempt(conn, **kwargs)
+    conn.commit()
+    return attempt_id
 
 
 def record_phoneme_events(
@@ -282,6 +318,17 @@ def record_phoneme_events(
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     conn = conn or get_connection()
+    _insert_events(conn, attempt_id, alignment)
+    conn.commit()
+
+
+def _insert_events(
+    conn: sqlite3.Connection,
+    attempt_id: int,
+    alignment: List[Dict[str, Any]],
+    scoring_engine: Optional[str] = None,
+) -> None:
+    """Insert alignment events WITHOUT committing (transaction-friendly)."""
     rows = []
     for position, row in enumerate(alignment):
         art = row.get("articulatory_distance", row.get("distance"))
@@ -298,15 +345,51 @@ def record_phoneme_events(
             float(compat_distance),
             None if art is None else float(art),
             None if cost is None else float(cost),
+            scoring_engine,
         ))
     conn.executemany(
         """INSERT INTO attempt_phoneme_events
            (attempt_id, position, expected_phoneme, spoken_phoneme, operation,
-            distance, articulatory_distance, alignment_cost)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            distance, articulatory_distance, alignment_cost, scoring_engine)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
-    conn.commit()
+
+
+def record_recording_atomic(
+    user_id: int,
+    attempt_kwargs: Dict[str, Any],
+    alignment: List[Dict[str, Any]],
+    scoring_engine: Optional[str] = None,
+    phoneme_states: Optional[Dict[str, Dict[str, Any]]] = None,
+    complete_exercise_id: Optional[int] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> int:
+    """Write attempt + events + mastery + assignment completion in ONE atomic
+    SQLite transaction. If any step raises, the whole write rolls back so a
+    partial failure can never leave inconsistent evidence (e.g. events without
+    the mastery update, or an assignment marked complete for an attempt that
+    was never fully recorded).
+
+    ``phoneme_states``: {phoneme: {alpha, beta, attempts_count, occurrence_count,
+    last_practiced_at}} to upsert (only when mastery was updated).
+    ``complete_exercise_id``: mark the latest open assignment for this exercise
+    complete (only when mastery was updated).
+    """
+    conn = conn or get_connection()
+    with conn:  # BEGIN; commits on success, rolls back on any exception
+        attempt_id = _insert_attempt(conn, user_id=user_id, **attempt_kwargs)
+        _insert_events(conn, attempt_id, alignment, scoring_engine)
+        if phoneme_states:
+            for phoneme, st in phoneme_states.items():
+                _upsert_phoneme_state(
+                    conn, user_id, phoneme,
+                    st["alpha"], st["beta"], st["attempts_count"],
+                    st["occurrence_count"], st["last_practiced_at"],
+                )
+        if complete_exercise_id is not None:
+            _complete_latest_assignment(conn, user_id, complete_exercise_id, attempt_id)
+    return attempt_id
 
 
 def get_attempt_phoneme_events(attempt_id: int, conn: Optional[sqlite3.Connection] = None) -> List[sqlite3.Row]:
@@ -357,6 +440,21 @@ def upsert_phoneme_state(
     number of independent recordings; ``occurrence_count`` is the number of
     phoneme occurrences observed."""
     conn = conn or get_connection()
+    _upsert_phoneme_state(conn, user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at)
+    conn.commit()
+
+
+def _upsert_phoneme_state(
+    conn: sqlite3.Connection,
+    user_id: int,
+    phoneme: str,
+    alpha: float,
+    beta: float,
+    attempts_count: int,
+    occurrence_count: int,
+    last_practiced_at: str,
+) -> None:
+    """Upsert one phoneme state WITHOUT committing (transaction-friendly)."""
     conn.execute(
         """INSERT INTO phoneme_skill_state
                (user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at)
@@ -369,7 +467,6 @@ def upsert_phoneme_state(
                last_practiced_at=excluded.last_practiced_at""",
         (user_id, phoneme, alpha, beta, attempts_count, occurrence_count, last_practiced_at),
     )
-    conn.commit()
 
 
 # -----------------------------
@@ -519,6 +616,14 @@ def complete_latest_assignment(
     """Stamp the most recent open (uncompleted) assignment for this
     (user, sentence) pair with the resulting attempt."""
     conn = conn or get_connection()
+    _complete_latest_assignment(conn, user_id, exercise_id, attempt_id)
+    conn.commit()
+
+
+def _complete_latest_assignment(
+    conn: sqlite3.Connection, user_id: int, exercise_id: int, attempt_id: int
+) -> None:
+    """Stamp the latest open assignment complete WITHOUT committing."""
     row = conn.execute(
         """SELECT id FROM practice_assignments
            WHERE user_id = ? AND exercise_id = ? AND completed_attempt_id IS NULL
@@ -531,7 +636,6 @@ def complete_latest_assignment(
         "UPDATE practice_assignments SET completed_attempt_id = ? WHERE id = ?",
         (attempt_id, row["id"]),
     )
-    conn.commit()
 
 
 def get_recently_served_sentence_ids(user_id: int, limit: int = 15, conn: Optional[sqlite3.Connection] = None) -> set:
@@ -547,10 +651,12 @@ def get_recently_served_sentence_ids(user_id: int, limit: int = 15, conn: Option
 # -----------------------------
 # Evidence / confusion aggregation for assessment + confusion-aware exercises
 # -----------------------------
-def _scorable_filter() -> str:
-    """SQL fragment: only count attempts that passed the audio-quality gate.
-    Tolerates pre-migration rows where `scorable` is NULL."""
-    return "(a.scorable IS NULL OR a.scorable != 0)"
+def _trusted_filter() -> str:
+    """SQL fragment: only count attempts whose evidence actually updated
+    mastery -- i.e. scorable audio scored by a TRUSTED (fully-validated
+    PanPhon) engine. Legacy rows default mastery_updated=0, so they are
+    treated as untrusted/unknown and excluded until explicitly migrated."""
+    return "a.mastery_updated = 1"
 
 
 def get_phoneme_context_stats(
@@ -569,7 +675,7 @@ def get_phoneme_context_stats(
             JOIN attempts a ON e.attempt_id = a.id
             WHERE a.user_id = ?
               AND e.expected_phoneme IS NOT NULL
-              AND {_scorable_filter()}
+              AND {_trusted_filter()}
             GROUP BY e.expected_phoneme""",
         (user_id,),
     ).fetchall()
@@ -598,7 +704,7 @@ def get_confusion_pairs(
                   AND e.operation LIKE '%substitution%'
                   AND e.expected_phoneme IS NOT NULL
                   AND e.spoken_phoneme IS NOT NULL
-                  AND {_scorable_filter()}
+                  AND {_trusted_filter()}
                 GROUP BY e.expected_phoneme, e.spoken_phoneme
                 ORDER BY count DESC"""
     params: tuple = (user_id,)
@@ -612,11 +718,12 @@ def get_confusion_pairs(
     ]
 
 
-def get_scorable_recording_count(user_id: int, conn: Optional[sqlite3.Connection] = None) -> int:
-    """Number of the user's recordings that passed the audio-quality gate."""
+def get_trusted_recording_count(user_id: int, conn: Optional[sqlite3.Connection] = None) -> int:
+    """Number of the user's recordings that were scorable AND scored by a
+    trusted engine (i.e. actually updated mastery)."""
     conn = conn or get_connection()
     row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM attempts a WHERE a.user_id = ? AND {_scorable_filter()}",
+        f"SELECT COUNT(*) AS n FROM attempts a WHERE a.user_id = ? AND {_trusted_filter()}",
         (user_id,),
     ).fetchone()
     return int(row["n"]) if row else 0

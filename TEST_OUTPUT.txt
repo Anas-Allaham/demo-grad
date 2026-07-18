@@ -1,0 +1,34 @@
+# Exact verification output
+
+## Environment
+Python 3.13.9
+panphon: installed 0.22.2
+scoring_engine: panphon | scoring_trusted: True | panphon validated: True
+
+## python -m compileall .
+compileall: OK (exit 0)
+
+## pytest -v
+============================= test session starts =============================
+platform win32 -- Python 3.13.9, pytest-9.1.1, pluggy-1.5.0
+rootdir: C:\projects\test-demo\pronunciation_web_app_g2p_integrated\pronunciation_web_app_integrated
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.12.0, typeguard-4.5.1
+collected 62 items
+
+tests\test_assessment.py ....                                            [  6%]
+tests\test_audio_and_degraded.py ...                                     [ 11%]
+tests\test_audit_exercises.py .......                                    [ 22%]
+tests\test_audit_persistence.py .....                                    [ 30%]
+tests\test_audit_quality_interval.py ....                                [ 37%]
+tests\test_audit_routes.py ......                                        [ 46%]
+tests\test_audit_speech_gate.py ......                                   [ 56%]
+tests\test_audit_trust.py .....                                          [ 64%]
+tests\test_content_and_build.py ....                                     [ 70%]
+tests\test_mastery.py ......                                             [ 80%]
+tests\test_scoring.py ....                                               [ 87%]
+tests\test_single_canonicalizer.py ...                                   [ 91%]
+tests\test_tokenization.py .....                                         [100%]
+
+============================= 62 passed in 20.34s =============================

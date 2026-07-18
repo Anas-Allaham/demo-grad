@@ -1,9 +1,36 @@
-model/my_wav2vec2_phoneme_model/model.safetensors
-uploads/
+# --- Python byte-code / caches ---
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# --- Secrets ---
+.env
+*.env
+!.env.example
+
+# --- Local database + WAL sidecars ---
 app.db
 app.db-wal
 app.db-shm
-.env
-*.env
+app.db.bak
+
+# --- Model weights (large; distributed separately) ---
+model/my_wav2vec2_phoneme_model/model.safetensors
+
+# --- Voice recordings & temporary processed audio (never commit user voice) ---
+# Keep the uploads/ directory but none of its contents.
+uploads/*
+!uploads/.gitkeep
+# Recording/container formats anywhere in the tree.
+*.webm
+*.ogg
+*.m4a
+*.opus
+# Temporary audio the pipeline writes next to an upload.
+*_converted.wav
+*_reduced.wav
+# Committed test fixtures are the ONLY audio that is tracked.
+!tests/fixtures/
+!tests/fixtures/**

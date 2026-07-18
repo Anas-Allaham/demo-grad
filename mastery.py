@@ -136,15 +136,23 @@ def update_mastery_for_recording(
     existing_stats: Dict[str, PhonemeStat],
     alignment: List[dict],
     now: datetime,
+    quality_weight: float = 1.0,
 ) -> Dict[str, PhonemeStat]:
     """Fold ONE recording's alignment into per-phoneme stats.
 
     For each expected phoneme in this recording:
       1. Mean of its soft observations -> a single Bernoulli-style evidence.
       2. Decay the existing posterior to ``now``.
-      3. Apply exactly one Beta update (alpha += mean, beta += 1 - mean).
+      3. Apply exactly one Beta update, SCALED by ``quality_weight``:
+             alpha += w * mean;  beta += w * (1 - mean)
+         Lower-quality audio therefore contributes LESS total evidence
+         (a wider, less-certain update) WITHOUT biasing the mean toward
+         failure -- alpha and beta are scaled by the same factor, so a noisy
+         recording never turns into a pronunciation "miss". A perfect
+         recording (w=1.0) is a full Bernoulli trial.
       4. occurrence_count += number of occurrences; independent_attempts += 1.
     """
+    weight = max(0.0, min(1.0, float(quality_weight)))
     updated = dict(existing_stats)
     for phoneme, observations in _grouped_observations(alignment).items():
         if not observations:
@@ -154,8 +162,8 @@ def update_mastery_for_recording(
         current = updated.get(phoneme, PhonemeStat())
         decayed = decayed_stat(current, now)
         updated[phoneme] = PhonemeStat(
-            alpha=decayed.alpha + mean_obs,
-            beta=decayed.beta + (1.0 - mean_obs),
+            alpha=decayed.alpha + weight * mean_obs,
+            beta=decayed.beta + weight * (1.0 - mean_obs),
             independent_attempts=decayed.independent_attempts + 1,
             occurrence_count=decayed.occurrence_count + occurrences,
             last_practiced_at=now,

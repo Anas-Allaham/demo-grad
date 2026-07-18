@@ -90,6 +90,12 @@ COMPOSITE_COMPONENTS: Mapping[str, Tuple[str, ...]] = {
     "eɪ": ("e", "ɪ"),
     "oʊ": ("o", "ʊ"),
     "ɔɪ": ("ɔ", "ɪ"),
+    # PanPhon has no single segment for the r-coloured central vowel /ɝ/
+    # (nor /ɚ/, which canonicalizes to /ɝ/). Represent it as a mid-central
+    # vowel + rhotic approximant so it still vectorizes -- otherwise it would
+    # be a phoneme PanPhon can never score, forcing the whole engine into the
+    # untrusted fallback.
+    "ɝ": ("ɜ", "ɹ"),
 }
 
 # Non-phoneme model tokens that never take part in scoring.
@@ -240,20 +246,65 @@ def _feature_table():
 
 
 def panphon_available() -> bool:
-    """True only when the real PanPhon library can be imported and loaded."""
+    """True when the real PanPhon library can be imported and its FeatureTable
+    loads. NOTE: this is necessary but NOT sufficient for trusted scoring -- a
+    phoneme can still fail to vectorize. Use ``scoring_trusted()`` for the trust
+    decision."""
     return _feature_table() is not None
 
 
-def scoring_engine() -> str:
-    """Which distance engine is actually in use.
+@lru_cache(maxsize=1)
+def validate_panphon_inventory() -> Dict[str, object]:
+    """Validate PanPhon by vectorizing EVERY assessable phoneme at startup.
 
-    ``"panphon"``           - real PanPhon articulatory vectors (trusted).
-    ``"fallback_features"`` - the small built-in class model (degraded).
-
-    app.py refuses to fold ``fallback_features`` results into trusted mastery
-    so PanPhon being unavailable never silently produces "professional" scores.
+    Trusted scoring requires that PanPhon can actually produce a vector for
+    each phoneme the app scores -- not merely that the library imported. If any
+    phoneme fails, the engine is reported as ``fallback_features`` so we never
+    silently use fallback distance while claiming ``scoring_trusted=True``.
     """
-    return "panphon" if panphon_available() else "fallback_features"
+    if not panphon_available():
+        return {
+            "ok": False,
+            "engine": "fallback_features",
+            "failures": sorted(ASSESSABLE_INVENTORY),
+            "checked": len(ASSESSABLE_INVENTORY),
+            "reason": "panphon_not_available",
+        }
+    failures: List[str] = []
+    for ph in sorted(ASSESSABLE_INVENTORY):
+        try:
+            vector = phoneme_vector(ph)
+            if not vector:
+                failures.append(ph)
+        except Exception:
+            failures.append(ph)
+    ok = not failures
+    return {
+        "ok": ok,
+        "engine": "panphon" if ok else "fallback_features",
+        "failures": failures,
+        "checked": len(ASSESSABLE_INVENTORY),
+        "reason": "" if ok else "incomplete_vectorization",
+    }
+
+
+def scoring_trusted() -> bool:
+    """True only when PanPhon can vectorize every assessable phoneme. This is
+    THE trust gate: mastery is only ever updated from trusted scores."""
+    return bool(validate_panphon_inventory()["ok"])
+
+
+def scoring_engine() -> str:
+    """Which distance engine is actually trusted for scoring.
+
+    ``"panphon"``           - real PanPhon vectors, fully validated (trusted).
+    ``"fallback_features"`` - PanPhon missing OR incomplete (degraded).
+
+    app.py refuses to fold ``fallback_features`` results into trusted mastery,
+    so a missing/incomplete PanPhon never silently produces "professional"
+    scores.
+    """
+    return str(validate_panphon_inventory()["engine"])
 
 
 # Feature weights used only to normalize the PanPhon vector distance.

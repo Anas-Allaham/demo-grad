@@ -5,6 +5,13 @@ librosa
 soundfile
 numpy
 noisereduce
+# PanPhon is REQUIRED for trusted scoring (the app validates that it can
+# vectorize every assessable phoneme at startup; otherwise it runs in the
+# untrusted fallback and does NOT update mastery). If PanPhon's `editdistance`
+# dependency fails to build on your platform, install with:
+#     pip install panphon --no-deps
+#     pip install pyyaml regex munkres unicodecsv numpy
+# The FeatureTable vector path this app uses does not need editdistance.
 panphon
 scipy
 python-dotenv

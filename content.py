@@ -77,6 +77,7 @@ W_TARGET_OCCURRENCE = 1.0          # weight on capped target-phoneme occurrences
 W_TARGET_COVERAGE = 1.5            # weight on number of distinct targets covered
 W_UNDER_OBSERVED = 0.6            # weight on covering under-observed phonemes
 W_DIVERSITY = 0.4                 # weight on word/context diversity
+W_CONFUSION = 1.2                # bonus for covering the confused-with phoneme
 W_DIFFICULTY_FIT = 2.0            # penalty weight for difficulty mismatch
 W_OVERMASTERED = 0.05            # gentle: mastered sounds are useful scaffolding
 W_LENGTH = 0.04                  # gentle length preference
@@ -96,6 +97,99 @@ LEVEL_DIFFICULTY = {
 }
 
 _client = None
+
+
+# Word-count bands per exercise type (drives real selection, not just a label).
+SHORT_PHRASE_MAX_WORDS = 5
+TARGETED_SENTENCE_MAX_WORDS = 14
+MAINTENANCE_MIN_WORDS = 10
+
+# Minimal pairs for the most common English confusions. Keyed as a frozenset so
+# lookup is order-independent (θ/s == s/θ). Each entry lists (word_a, word_b)
+# pairs that isolate exactly that contrast -- the core material for low-mastery
+# / confusion practice.
+MINIMAL_PAIRS: Dict[frozenset, List[tuple]] = {
+    frozenset({"θ", "s"}): [("think", "sink"), ("thick", "sick"), ("thing", "sing"), ("mouth", "mouse")],
+    frozenset({"ð", "d"}): [("they", "day"), ("though", "dough"), ("breathe", "breed")],
+    frozenset({"v", "f"}): [("van", "fan"), ("vine", "fine"), ("leave", "leaf")],
+    frozenset({"w", "v"}): [("wine", "vine"), ("west", "vest"), ("worse", "verse")],
+    frozenset({"ɪ", "i"}): [("ship", "sheep"), ("bit", "beat"), ("sit", "seat"), ("fill", "feel")],
+    frozenset({"ʊ", "u"}): [("full", "fool"), ("pull", "pool")],
+    frozenset({"l", "ɹ"}): [("light", "right"), ("lace", "race"), ("glass", "grass")],
+    frozenset({"n", "ŋ"}): [("thin", "thing"), ("sin", "sing"), ("ban", "bang")],
+    frozenset({"z", "s"}): [("zip", "sip"), ("zoo", "sue"), ("prize", "price")],
+    frozenset({"b", "p"}): [("bat", "pat"), ("bin", "pin"), ("cab", "cap")],
+    frozenset({"d", "t"}): [("dime", "time"), ("den", "ten"), ("bad", "bat")],
+    frozenset({"ɛ", "æ"}): [("bed", "bad"), ("pen", "pan"), ("said", "sad")],
+    frozenset({"ʃ", "s"}): [("ship", "sip"), ("shy", "sigh"), ("shell", "sell")],
+    frozenset({"tʃ", "ʃ"}): [("chip", "ship"), ("chew", "shoe"), ("watch", "wash")],
+}
+
+# A few isolated words per phoneme for low-mastery practice when no confusion
+# pair applies.
+ISOLATED_WORDS: Dict[str, List[str]] = {
+    "θ": ["think", "three", "bath"], "ð": ["this", "mother", "breathe"],
+    "s": ["see", "grass", "bus"], "z": ["zoo", "buzz", "easy"],
+    "ʃ": ["she", "wash", "ocean"], "ʒ": ["measure", "vision"],
+    "tʃ": ["chair", "watch", "teacher"], "dʒ": ["jump", "bridge", "giant"],
+    "v": ["van", "love", "seven"], "f": ["fish", "coffee", "leaf"],
+    "ɹ": ["red", "very", "car"], "l": ["light", "yellow", "ball"],
+    "w": ["water", "away"], "j": ["yes", "yellow"],
+    "ŋ": ["sing", "long", "finger"], "ɪ": ["sit", "ship", "him"],
+    "i": ["see", "green", "meet"], "ʊ": ["book", "put"], "u": ["food", "blue"],
+    "ɛ": ["bed", "red"], "æ": ["cat", "bad"], "ɑ": ["father", "hot"],
+    "ɔ": ["thought", "ball"], "ʌ": ["cup", "sun"], "ə": ["about", "sofa"],
+    "ɝ": ["bird", "her", "world"], "aɪ": ["my", "time"], "aʊ": ["now", "house"],
+    "eɪ": ["day", "cake"], "oʊ": ["go", "home"], "ɔɪ": ["boy", "toy"],
+    "p": ["pen", "apple"], "b": ["boy", "table"], "t": ["top", "water"],
+    "d": ["dog", "red"], "k": ["cat", "book"], "ɡ": ["go", "big"],
+    "h": ["hat", "behind"], "m": ["man", "swim"], "n": ["no", "sun"],
+}
+
+
+def minimal_pair_words(phoneme_a: str, phoneme_b: str) -> Optional[List[tuple]]:
+    """Return minimal-pair word tuples that contrast the two phonemes, if any."""
+    return MINIMAL_PAIRS.get(frozenset({canonicalize_phoneme(phoneme_a), canonicalize_phoneme(phoneme_b)}))
+
+
+def build_word_exercise(
+    words: List[str],
+    g2p_convert: Callable[[str], str],
+    ipa_to_tokens: Callable[[str], List[str]],
+    source: str,
+) -> Optional[Dict]:
+    """Tag a short list of words (an isolated-word or minimal-pair drill) with
+    the SAME G2P pipeline used for scoring, so it is a first-class, verified
+    exercise -- not a special-cased string."""
+    text = " ".join(words)
+    tagged = tag_sentence(text, g2p_convert, ipa_to_tokens)
+    if not is_valid_tagging(tagged):
+        return None
+    tagged["source"] = source
+    return tagged
+
+
+def make_low_mastery_exercise(
+    target: str,
+    confused_with: Optional[str],
+    g2p_convert: Callable[[str], str],
+    ipa_to_tokens: Callable[[str], List[str]],
+) -> Optional[Dict]:
+    """Isolated-words / minimal-pairs drill for a low-mastery target. Prefers a
+    minimal pair against the learner's actual confusion, else isolated words."""
+    if confused_with:
+        pairs = minimal_pair_words(target, confused_with)
+        if pairs:
+            words: List[str] = []
+            for a, b in pairs[:3]:
+                words.extend([a, b])
+            ex = build_word_exercise(words, g2p_convert, ipa_to_tokens, source="minimal_pairs")
+            if ex is not None:
+                return ex
+    words = ISOLATED_WORDS.get(canonicalize_phoneme(target), [])
+    if words:
+        return build_word_exercise(words[:3], g2p_convert, ipa_to_tokens, source="isolated_words")
+    return None
 
 
 def normalize_difficulty(level_proxy: float) -> float:
@@ -181,6 +275,7 @@ def score_candidate(
     level_proxy: Optional[float] = None,
     target_difficulty: Optional[float] = None,
     under_observed_phonemes: Optional[Iterable[str]] = None,
+    confusion_phonemes: Optional[Iterable[str]] = None,
 ) -> float:
     """Score a candidate sentence for how well it fits the learner right now.
 
@@ -188,6 +283,8 @@ def score_candidate(
       * target-phoneme OCCURRENCE counts, capped so a sentence isn't rewarded
         for cramming one sound unnaturally;
       * how many DISTINCT target phonemes it covers;
+      * CONTRASTIVE value: covering the phoneme the learner confuses the target
+        with (so retrieval, not just LLM generation, is confusion-aware);
       * coverage of under-observed phonemes (diagnostic value);
       * word/context diversity;
       * fit between the sentence difficulty (from level_proxy) and the
@@ -200,12 +297,17 @@ def score_candidate(
     target_phonemes = list(target_phonemes)
     overmastered_phonemes = set(overmastered_phonemes)
     under_observed_phonemes = set(under_observed_phonemes or ())
+    confusion_phonemes = set(confusion_phonemes or ())
 
     # Target occurrences (capped) + distinct-target coverage.
     occurrence_score = sum(
         min(phoneme_counts.get(p, 0), TARGET_OCCURRENCE_CAP) for p in target_phonemes
     )
     coverage = sum(1 for p in target_phonemes if p in phoneme_counts)
+
+    # Contrastive bonus: a sentence covering BOTH the target and the sound it is
+    # confused with lets the learner practise the distinction.
+    confusion_cover = sum(1 for p in confusion_phonemes if p in phoneme_counts)
 
     under_observed_cover = sum(1 for p in under_observed_phonemes if p in phoneme_counts)
 
@@ -224,6 +326,7 @@ def score_candidate(
     return (
         W_TARGET_OCCURRENCE * occurrence_score
         + W_TARGET_COVERAGE * coverage
+        + W_CONFUSION * confusion_cover
         + W_UNDER_OBSERVED * under_observed_cover
         + W_DIVERSITY * math.log1p(diversity)
         - W_DIFFICULTY_FIT * difficulty_penalty
@@ -241,20 +344,30 @@ def pick_next_sentence(
     target_word_count: int = TARGET_WORD_COUNT,
     target_difficulty: Optional[float] = None,
     under_observed_phonemes: Optional[Iterable[str]] = None,
+    confusion_phonemes: Optional[Iterable[str]] = None,
+    word_count_range: Optional[tuple] = None,
 ) -> Optional[Dict]:
     """Best-scoring candidate covering at least one target phoneme, biased away
     from recently served sentences and toward a difficulty that fits the
-    learner. Falls back to a recent sentence rather than serving nothing."""
+    learner. ``word_count_range`` (min, max) restricts to a length band for the
+    exercise type (short phrase / sentence / connected speech); it relaxes
+    rather than returning nothing. Falls back to a recent sentence if needed."""
     overmastered_phonemes = set(overmastered_phonemes or ())
     recently_served_ids = set(recently_served_ids or ())
     under_observed_phonemes = set(under_observed_phonemes or ())
+    confusion_phonemes = set(confusion_phonemes or ())
 
     if not candidates:
         return None
 
-    eligible = [c for c in candidates if c["id"] not in recently_served_ids] or candidates
+    pool = [c for c in candidates if c["id"] not in recently_served_ids] or candidates
+    if word_count_range is not None:
+        lo, hi = word_count_range
+        banded = [c for c in pool if lo <= c["word_count"] <= hi]
+        pool = banded or pool  # relax the band rather than serve nothing
+
     return max(
-        eligible,
+        pool,
         key=lambda c: score_candidate(
             c["phoneme_counts"],
             target_phonemes,
@@ -264,6 +377,7 @@ def pick_next_sentence(
             level_proxy=c.get("level_proxy"),
             target_difficulty=target_difficulty,
             under_observed_phonemes=under_observed_phonemes,
+            confusion_phonemes=confusion_phonemes,
         ),
     )
 

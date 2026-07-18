@@ -22,7 +22,9 @@ NOT a CEFR level. Thresholds are configurable and labelled provisional.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 import mastery
 from phoneme_vectors_professional import (
@@ -30,6 +32,33 @@ from phoneme_vectors_professional import (
     canonicalize_phoneme,
     is_assessable,
 )
+
+# ---- Posterior credible interval (Monte Carlo) ------------------------------
+# The macro-average pronunciation score is a function of several independent
+# Beta posteriors, so its own distribution has no closed form. We estimate it by
+# Monte Carlo: draw from each phoneme's (decayed) Beta posterior, average across
+# phonemes per draw, and take percentiles of that macro-average distribution.
+# Deterministic given the seed, so tests are reproducible.
+MC_SAMPLES = 4000
+MC_SEED = 20260718
+CREDIBLE_MASS = 0.95
+
+
+def _posterior_macro_interval(
+    alpha_betas: Sequence[Tuple[float, float]],
+    seed: int = MC_SEED,
+    n_samples: int = MC_SAMPLES,
+    credible_mass: float = CREDIBLE_MASS,
+) -> Tuple[float, float, float]:
+    """Monte-Carlo posterior mean and credible interval of the macro-average
+    over independent Beta posteriors. Returns (mean, low, high) in [0, 1]."""
+    if not alpha_betas:
+        return (0.0, 0.0, 0.0)
+    rng = np.random.default_rng(seed)
+    draws = np.stack([rng.beta(max(a, 1e-6), max(b, 1e-6), size=n_samples) for a, b in alpha_betas])
+    macro = draws.mean(axis=0)
+    tail = (1.0 - credible_mass) / 2.0
+    return (float(macro.mean()), float(np.quantile(macro, tail)), float(np.quantile(macro, 1.0 - tail)))
 
 # ---- Eligibility (configurable, provisional) --------------------------------
 MIN_RECORDINGS_FOR_ELIGIBLE = 3      # independent recordings before a phoneme counts
@@ -130,15 +159,14 @@ def assess_user_level(
 
     weak: List[Dict[str, Any]] = []
     strong: List[str] = []
-    conservative_scores: List[float] = []
-    mean_scores: List[float] = []
+    eligible_alpha_betas: List[Tuple[float, float]] = []
 
     for phoneme in eligible:
         stat = tracked[phoneme]
+        decayed = mastery.decayed_stat(stat, now)
+        eligible_alpha_betas.append((decayed.alpha, decayed.beta))
         lcb = mastery.lower_confidence_bound(stat, now=now)   # conservative
         mean = mastery.posterior_mean(stat, now=now)
-        conservative_scores.append(lcb)
-        mean_scores.append(mean)
         if mean >= STRONG_MASTERY_THRESHOLD:
             strong.append(phoneme)
         elif lcb < WEAK_MASTERY_THRESHOLD:
@@ -164,17 +192,14 @@ def assess_user_level(
     else:
         status = "provisional"
 
-    if conservative_scores and status != "insufficient_evidence":
-        # Macro (per-phoneme equal-weight) average of the conservative estimate.
-        pronunciation_score: Optional[float] = round(
-            100.0 * sum(conservative_scores) / len(conservative_scores), 1
-        )
-        ci_low = round(100.0 * min(conservative_scores), 1)
-        ci_high = round(100.0 * (sum(mean_scores) / len(mean_scores)), 1)
-        confidence_interval: Optional[List[float]] = [ci_low, ci_high]
+    if eligible_alpha_betas and status != "insufficient_evidence":
+        # Real posterior of the macro-average via Monte Carlo (deterministic).
+        mc_mean, mc_low, mc_high = _posterior_macro_interval(eligible_alpha_betas)
+        pronunciation_score: Optional[float] = round(100.0 * mc_mean, 1)
+        credible_interval: Optional[List[float]] = [round(100.0 * mc_low, 1), round(100.0 * mc_high, 1)]
     else:
         pronunciation_score = None
-        confidence_interval = None
+        credible_interval = None
 
     return {
         "pronunciation_score": pronunciation_score,
@@ -184,7 +209,12 @@ def assess_user_level(
         "eligible_phoneme_count": eligible_count,
         "tracked_phoneme_count": len(tracked),
         "independent_recording_count": independent_recording_count,
-        "confidence_interval": confidence_interval,
+        # A real Bayesian posterior credible interval for the macro-average
+        # (Monte Carlo over the eligible Beta posteriors). Named accurately --
+        # it is NOT a frequentist confidence interval.
+        "credible_interval": credible_interval,
+        "credible_mass": CREDIBLE_MASS,
+        "interval_method": "beta_posterior_monte_carlo",
         "weak_phonemes": weak,
         "unknown_phonemes": unknown,
         "strong_phonemes": sorted(strong),

@@ -14,6 +14,41 @@ adaptive, confusion-aware per-phoneme practice loop.
 
 ---
 
+## Audit revisions (v2)
+
+This version hardens the evidence pipeline:
+
+1. **Speech-presence audio gate** — energy is no longer enough. White noise, a
+   sine tone, a DC offset, silence, and clipping are rejected using spectral
+   flatness, spectral bandwidth, zero-crossing rate, and syllable-rate envelope
+   modulation. Validated against a real speech fixture (`tests/fixtures/`).
+2. **Scoring provenance & trust** — every attempt stores `scoring_engine`,
+   `scoring_trusted`, and `mastery_updated`; events store their engine too.
+   Assessment coverage, prompt counts, confusion pairs, and diagnostic progress
+   count **trusted, mastery-updating recordings only**. Legacy rows are treated
+   as untrusted/unknown unless explicitly migrated.
+3. **PanPhon validated at startup** — PanPhon must vectorize *every* assessable
+   phoneme or the engine reports `fallback_features` (untrusted). It never
+   silently uses fallback distance while claiming `scoring_trusted=true`.
+   **Trusted scoring requires PanPhon** (`pip install panphon`).
+4. **Audio quality = fractional evidence** — `quality_weight` scales the Beta
+   update symmetrically (less certain), never converting low quality into a
+   pronunciation failure.
+5. **Real credible interval** — the macro-average now has a genuine Bayesian
+   posterior **credible interval** via deterministic Monte-Carlo sampling of the
+   per-phoneme Beta posteriors (renamed from the old fake "confidence interval").
+6. **Functional exercise types** — mastery drives the actual material: minimal
+   pairs / isolated words (low), short phrases, targeted sentences, or
+   maintenance/connected speech. Retrieval is confusion-aware, not only the LLM.
+7. **Insertions tracked separately** — epenthesis affects the utterance-level
+   score but is never attributed to an expected phoneme's mastery.
+8. **Private, temporary audio** — original, converted, and reduced recordings are
+   deleted after processing unless `RETAIN_AUDIO=1`. No recordings ship.
+9. **Atomic writes** — attempt + events + mastery + assignment completion happen
+   in one SQLite transaction; a partial failure rolls back entirely.
+
+---
+
 ## Pipeline
 
 ```text
@@ -140,16 +175,19 @@ Decay is applied **on read** (ranking, display, level assessment, mastered
 checks), so stale skills decay in real time.
 
 ### Evidence-aware level (provisional; **not** CEFR)
-A phoneme is *level-eligible* only after **≥ 3 independent recordings** across
-**≥ 2 distinct prompts**. The score is the **macro-average of the conservative
-(lower-confidence-bound) posterior** over eligible phonemes × 100:
+A phoneme is *level-eligible* only after **≥ 3 independent, trusted recordings**
+across **≥ 2 distinct prompts** (only recordings that were scorable AND scored
+by a trusted PanPhon engine count). The score is the **posterior mean of the
+macro-average** over eligible phonemes, with a real **credible interval** from
+Monte-Carlo sampling of the per-phoneme Beta posteriors:
 ```
-pronunciation_score = 100 × mean( LCB(phoneme) for eligible phonemes )
-overall_level       = beginner (<55) | intermediate (<78) | advanced (≥78)   # provisional thresholds
-assessment_status   = insufficient_evidence | provisional | established      # by inventory coverage
+pronunciation_score = 100 × E[ mean(sample_i(phoneme) for eligible phonemes) ]   # MC posterior mean
+credible_interval   = 100 × [q2.5, q97.5] of that macro-average distribution     # 95% Bayesian CI
+overall_level       = beginner (<55) | intermediate (<78) | advanced (≥78)       # provisional thresholds
+assessment_status   = insufficient_evidence | provisional | established          # by inventory coverage
 ```
 Too little coverage → `insufficient_evidence` and `overall_level = "unknown"`
-(the app never invents a level).
+(the app never invents a level). The Monte-Carlo is deterministic (fixed seed).
 
 ---
 

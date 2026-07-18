@@ -150,6 +150,12 @@ def calculate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     substitutions = sum(1 for r in results if r.endswith("_substitution"))
 
     weighted_error = sum(r["alignment_cost"] for r in rows if r["result"] != "correct")
+    # Insertions/epenthesis are tracked SEPARATELY. They have no expected
+    # phoneme, so they must never touch a per-phoneme mastery update (mastery.py
+    # skips them) -- but they ARE real utterance-level errors, so their cost is
+    # included in the utterance-level weighted PER / accuracy below.
+    insertion_penalty = sum(r["alignment_cost"] for r in rows if r["result"] == "insertion")
+    insertion_rate = (insertions / total_reference_units) if total_reference_units > 0 else 0.0
 
     if total_reference_units > 0:
         raw_weighted_per = (weighted_error / total_reference_units) * 100.0
@@ -171,10 +177,15 @@ def calculate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unknown_substitutions": unknown,
         "deletions": deletions,
         "insertions": insertions,
+        "insertion_count": insertions,
+        "insertion_rate": round(insertion_rate, 3),
+        "insertion_penalty": round(insertion_penalty, 3),
         "weighted_error": round(weighted_error, 3),
         "raw_weighted_per": round(raw_weighted_per, 2),
         "display_error_percent": round(display_error_percent, 2),
         "display_accuracy_percent": round(display_accuracy_percent, 2),
+        # Utterance-level provisional score (0-100). Includes insertions.
+        "utterance_score": round(display_accuracy_percent, 2),
         # Backward-compatible field the current UI reads. Equals the capped
         # display error percent.
         "phoneme_error_rate": round(display_error_percent, 2),

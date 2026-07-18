@@ -46,6 +46,23 @@ HOP_S = 0.010                  # 10 ms hop
 SILENCE_REL_TO_PEAK = 0.08     # frame is "silent" below 8% of peak frame RMS
 SILENCE_ABS_FLOOR = 1e-4
 
+# ---- Speech-presence thresholds ---------------------------------------------
+# Energy alone cannot tell speech from white noise, a sine tone, or a DC
+# offset -- all can be "loud". These spectral/temporal features do, validated
+# against a real speech fixture vs synthetic noise/tone/DC/clipping:
+#   * envelope modulation  - real speech has strong syllable-rate amplitude
+#     modulation (~0.5-0.7); steady signals (noise/tone/DC/clipping) are ~0.0.
+#   * spectral flatness    - white noise ~1.0; pure tone/DC ~0.0; speech ~0.1-0.4.
+#   * spectral bandwidth    - a pure tone/DC is near-zero bandwidth; speech is wide.
+#   * zero-crossing rate    - a DC/sub-sonic signal barely crosses zero.
+SPEECH_MODULATION_MIN = 0.20   # below this = no speech-like modulation
+SPEECH_FLATNESS_MAX = 0.55     # above this = broadband noise, not speech
+SPEECH_FLATNESS_MIN = 0.012    # below this = pure tone / DC, not speech
+SPEECH_BANDWIDTH_MIN = 0.02    # normalized to Nyquist; below = tonal, not speech
+SPEECH_ZCR_MIN = 0.004         # below = DC / sub-sonic, not speech
+SPEECH_FRAME_S = 0.025         # 25 ms window for spectral analysis
+HIGHPASS_HZ = 60.0             # remove DC + mains hum before speech analysis
+
 
 @dataclass
 class AudioQualityDecision:
@@ -61,6 +78,66 @@ class AudioQualityDecision:
             "reasons": self.reasons,
             "metrics": self.metrics,
         }
+
+
+def _remove_dc_and_rumble(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Remove the DC offset and sub-~60 Hz rumble/mains hum before speech
+    analysis. Real speech is AC energy above ~60 Hz; a DC bias or low-frequency
+    hum (both common with real mics / browser capture) otherwise dumps energy at
+    0 Hz and makes genuine speech look tonal / sub-sonic to the gate."""
+    audio = audio - float(np.mean(audio))  # remove DC offset
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        nyquist = sr / 2.0
+        cutoff = min(HIGHPASS_HZ, nyquist * 0.9) / nyquist
+        if 0 < cutoff < 1 and len(audio) > 27:
+            sos = butter(2, cutoff, btype="highpass", output="sos")
+            audio = sosfiltfilt(sos, audio).astype(np.float64)
+    except Exception:
+        pass  # DC removal alone still helps if scipy is unavailable
+    return audio
+
+
+def _speech_presence_features(audio: np.ndarray, sr: int) -> Optional[Dict[str, float]]:
+    """Spectral/temporal features that distinguish real speech from white
+    noise, a sine tone, a DC offset, or clipping. Returns None if the signal
+    is too short to analyze."""
+    win = max(8, int(SPEECH_FRAME_S * sr))
+    hop = max(1, int(HOP_S * sr))
+    if len(audio) < win:
+        return None
+
+    n_frames = 1 + (len(audio) - win) // hop
+    idx = np.arange(win)[None, :] + hop * np.arange(n_frames)[:, None]
+    window = np.hanning(win)[None, :]
+    frames = audio[idx] * window
+
+    frame_energy = np.sqrt(np.mean(frames ** 2, axis=1))
+    power = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+    avg_power = power.mean(axis=0) + 1e-12
+
+    # Spectral flatness: geometric mean / arithmetic mean of the power spectrum.
+    flatness = float(np.exp(np.mean(np.log(avg_power))) / np.mean(avg_power))
+
+    freqs = np.fft.rfftfreq(win, 1.0 / sr)
+    nyquist = sr / 2.0
+    centroid = float(np.sum(freqs * avg_power) / np.sum(avg_power))
+    bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * avg_power) / np.sum(avg_power)))
+
+    zcr = float(np.mean(np.abs(np.diff(np.sign(audio))) > 0)) if len(audio) > 1 else 0.0
+
+    # Envelope modulation: coefficient of variation of voiced-frame energy.
+    voiced = frame_energy > max(float(frame_energy.max()) * SILENCE_REL_TO_PEAK, SILENCE_ABS_FLOOR)
+    voiced_energy = frame_energy[voiced] if voiced.any() else frame_energy
+    modulation = float(np.std(voiced_energy) / (np.mean(voiced_energy) + 1e-9))
+
+    return {
+        "spectral_flatness": round(flatness, 4),
+        "spectral_centroid": round(centroid / nyquist, 4),
+        "spectral_bandwidth": round(bandwidth / nyquist, 4),
+        "zero_crossing_rate": round(zcr, 4),
+        "envelope_modulation": round(modulation, 4),
+    }
 
 
 def _frame_rms(audio: np.ndarray, sr: int) -> np.ndarray:
@@ -91,9 +168,15 @@ def analyze_audio_quality(audio: np.ndarray, sr: int) -> AudioQualityDecision:
         finite_ratio = 1.0
 
     duration = len(audio) / float(sr)
+    # Clipping is judged on the RAW samples (it is about hitting the rails).
     peak = float(np.max(np.abs(audio)))
-    rms = float(np.sqrt(np.mean(audio ** 2)))
     clipping_ratio = float(np.mean(np.abs(audio) >= CLIPPING_LEVEL))
+    dc_offset = float(np.mean(audio))
+
+    # Everything speech-related is judged on the DC/rumble-removed signal so a
+    # mic DC bias or mains hum can't make real speech look tonal/sub-sonic.
+    audio = _remove_dc_and_rumble(audio, sr)
+    rms = float(np.sqrt(np.mean(audio ** 2)))
 
     # ---- Frame-level voiced analysis ----
     frame_rms = _frame_rms(audio, sr)
@@ -119,6 +202,9 @@ def analyze_audio_quality(audio: np.ndarray, sr: int) -> AudioQualityDecision:
             max_run = max(max_run, run)
         max_internal_gap_s = max_run * HOP_S
 
+    # ---- Speech-presence analysis (rejects loud non-speech) ----
+    speech = _speech_presence_features(audio, sr)
+
     metrics = {
         "duration_seconds": round(duration, 3),
         "peak_amplitude": round(peak, 6),
@@ -129,7 +215,10 @@ def analyze_audio_quality(audio: np.ndarray, sr: int) -> AudioQualityDecision:
         "internal_silence_ratio": round(internal_silence_ratio, 3),
         "max_internal_gap_seconds": round(max_internal_gap_s, 3),
         "finite_ratio": round(finite_ratio, 4),
+        "dc_offset": round(dc_offset, 5),
     }
+    if speech is not None:
+        metrics.update(speech)
 
     # ---- Hard gates ----
     if duration < MIN_DURATION_S:
@@ -149,11 +238,28 @@ def analyze_audio_quality(audio: np.ndarray, sr: int) -> AudioQualityDecision:
     if max_internal_gap_s > DROPOUT_MIN_S and internal_silence_ratio > MAX_INTERNAL_SILENCE_RATIO:
         reasons.append("excessive_internal_dropout")
 
+    # ---- Speech-presence gates (energy alone is not speech) ----
+    # Envelope modulation is the PRIMARY discriminator: real speech has strong
+    # syllable-rate modulation (~0.5); white noise, tones, and DC are steady
+    # (~0). The spectral checks only add a specific reason for a STEADY signal,
+    # so genuine, modulated speech is never rejected on spectral shape alone.
+    if speech is not None:
+        if speech["envelope_modulation"] < SPEECH_MODULATION_MIN:
+            reasons.append("no_speech_modulation")       # steady: not speech
+            if speech["spectral_flatness"] > SPEECH_FLATNESS_MAX:
+                reasons.append("noise_like_spectrum")    # white noise
+            if speech["spectral_flatness"] < SPEECH_FLATNESS_MIN or speech["spectral_bandwidth"] < SPEECH_BANDWIDTH_MIN:
+                reasons.append("tonal_not_speech")       # pure sine tone
+            if speech["zero_crossing_rate"] < SPEECH_ZCR_MIN:
+                reasons.append("dc_or_subsonic")         # DC offset / sub-sonic
+
     # Fatal reasons make the recording unscorable outright.
     fatal = {
         "empty_audio", "silent", "too_short", "too_long", "very_low_level",
         "insufficient_voiced_speech", "insufficient_speech_span",
         "excessive_internal_dropout",
+        "no_speech_modulation", "noise_like_spectrum", "tonal_not_speech",
+        "dc_or_subsonic",
     }
     scorable = not (set(reasons) & fatal)
 

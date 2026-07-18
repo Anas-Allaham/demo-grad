@@ -1,8 +1,10 @@
 """Tests 13 & 18: audio-quality gate and PanPhon-unavailable safety."""
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
 import mastery
 from audio_quality import analyze_audio_quality, should_update_mastery
@@ -10,11 +12,14 @@ from phoneme_vectors_professional import panphon_available, scoring_engine
 
 SR = 16000
 FIXED_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+SPEECH_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "speech_sample.wav"
 
 
-def _noise(seconds, level=0.3, seed=0):
-    rng = np.random.default_rng(seed)
-    return rng.normal(0.0, level, int(seconds * SR)).astype(np.float32)
+def _load_speech_fixture():
+    audio, sr = sf.read(str(SPEECH_FIXTURE))
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    return np.asarray(audio, dtype=np.float64), int(sr)
 
 
 # 13. Non-scorable audio does not update mastery.
@@ -35,11 +40,11 @@ def test_non_scorable_audio_blocks_mastery_update():
     assert after["θ"].alpha == 3.0
 
 
-def test_scorable_audio_passes_gate():
-    good = np.concatenate([np.zeros(int(0.2 * SR), dtype=np.float32),
-                           _noise(1.6), np.zeros(int(0.2 * SR), dtype=np.float32)])
-    decision = analyze_audio_quality(good, SR)
+def test_real_speech_fixture_passes_gate():
+    audio, sr = _load_speech_fixture()
+    decision = analyze_audio_quality(audio, sr)
     assert decision.scorable is True
+    assert decision.reasons == []
     assert should_update_mastery(decision.scorable, scoring_trusted=True) is True
 
 

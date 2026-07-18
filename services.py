@@ -29,6 +29,7 @@ import content
 import db
 import mastery
 from app_datetime import parse_db_datetime
+from phoneme_vectors_professional import canonicalize_phoneme
 
 
 def _stats_from_rows(rows) -> Dict[str, "mastery.PhonemeStat"]:
@@ -53,7 +54,7 @@ def assess_profile(user_id: int, now: Optional[datetime] = None) -> Dict[str, An
     now = now or datetime.now(timezone.utc)
     stats = load_profile_stats(user_id)
     context_stats = db.get_phoneme_context_stats(user_id)
-    recording_count = db.get_scorable_recording_count(user_id)
+    recording_count = db.get_trusted_recording_count(user_id)
     return assessment_mod.assess_user_level(stats, context_stats, recording_count, now=now)
 
 
@@ -66,26 +67,61 @@ def _confusion_hint_for(target: Optional[str], confusion_pairs: List[Dict[str, A
     return f"{confusion['expected']} vs {confusion['spoken']}"
 
 
+def _word_count_range_for(exercise_type: str) -> Optional[tuple]:
+    """Length band each functional exercise type draws from."""
+    if exercise_type == "short_phrase":
+        return (1, content.SHORT_PHRASE_MAX_WORDS)
+    if exercise_type == "targeted_sentence":
+        return (1, content.TARGETED_SENTENCE_MAX_WORDS)
+    if exercise_type == "maintenance":
+        return (content.MAINTENANCE_MIN_WORDS, content.MAX_WORD_COUNT)
+    return None
+
+
 def choose_exercise(
     targets: List[str],
     overmastered: List[str],
     under_observed: List[str],
     overall_level: Optional[str],
-    confusion_hint: Optional[str],
     recently_served_ids: set,
     g2p_convert: Callable[[str], str],
     ipa_to_tokens: Callable[[str], List[str]],
+    exercise_type: str = "targeted_sentence",
+    top_target: Optional[str] = None,
+    confusion_phoneme: Optional[str] = None,
     diagnostic: bool = False,
 ) -> Dict[str, Any]:
-    """Shared exercise-selection policy. Returns
-    {source_mode, exercise|None, generated|None}."""
+    """Shared, exercise-type-driven selection policy. Returns
+    {source_mode, exercise|None, generated|None}.
+
+    ``exercise_type`` actually shapes what is served:
+      * minimal_pairs   -> isolated words / minimal pairs (confusion-aware)
+      * short_phrase    -> short bank sentences
+      * targeted_sentence -> normal targeted sentences
+      * maintenance     -> longer / connected-speech sentences
+    Retrieval is confusion-aware via ``confusion_phoneme`` (the sound the
+    learner substitutes for the target), not only the LLM path.
+    """
     target_difficulty = content.difficulty_for_level(overall_level)
+    confusion_hint = (
+        f"{canonicalize_phoneme(top_target)} vs {canonicalize_phoneme(confusion_phoneme)}"
+        if top_target and confusion_phoneme else None
+    )
+    confusion_phonemes = {confusion_phoneme} if confusion_phoneme else set()
 
     if diagnostic or not targets:
         chosen = content.pick_diagnostic_sentence(
             db.get_all_sentences(), recently_served_ids, uncovered_phonemes=under_observed
         )
         return {"source_mode": "diagnostic", "exercise": chosen, "generated": None}
+
+    # Low mastery: serve actual isolated words / minimal pairs (contrastive).
+    if exercise_type == "minimal_pairs":
+        drill = content.make_low_mastery_exercise(
+            top_target or targets[0], confusion_phoneme, g2p_convert, ipa_to_tokens
+        )
+        if drill is not None:
+            return {"source_mode": drill["source"], "exercise": None, "generated": drill}
 
     candidates = db.get_sentences_covering_any(targets)
     best = content.pick_next_sentence(
@@ -95,21 +131,19 @@ def choose_exercise(
         recently_served_ids=recently_served_ids,
         target_difficulty=target_difficulty,
         under_observed_phonemes=under_observed,
+        confusion_phonemes=confusion_phonemes,
+        word_count_range=_word_count_range_for(exercise_type),
     )
 
     required_overlap = (len(targets) + 1) // 2
     best_overlap = 0 if best is None else sum(1 for p in targets if p in best["phoneme_counts"])
 
     generated = None
-    source_mode = "targeted"
+    source_mode = exercise_type
     if best_overlap < required_overlap:
         generated = content.generate_and_verify_exercise(
-            targets,
-            overmastered,
-            g2p_convert,
-            ipa_to_tokens,
-            level=overall_level,
-            confusion_hint=confusion_hint,
+            targets, overmastered, g2p_convert, ipa_to_tokens,
+            level=overall_level, confusion_hint=confusion_hint,
         )
         if generated is not None:
             source_mode = "generated"
@@ -117,7 +151,7 @@ def choose_exercise(
     if generated is not None:
         return {"source_mode": source_mode, "exercise": None, "generated": generated}
     if best is not None:
-        return {"source_mode": "targeted", "exercise": best, "generated": None}
+        return {"source_mode": exercise_type, "exercise": best, "generated": None}
 
     chosen = content.pick_diagnostic_sentence(
         db.get_all_sentences(), recently_served_ids, uncovered_phonemes=under_observed
@@ -139,15 +173,21 @@ def generate_exercise(
     targets = [w["phoneme"] for w in assessment["weak_phonemes"]][: content.MIN_TARGET_REPETITIONS + 1]
     overmastered = assessment["strong_phonemes"]
 
+    top_target = targets[0] if targets else None
+    top_mastery = (metrics or {}).get(top_target) if top_target else None
+    exercise_type = assessment_mod.exercise_type_for_mastery(top_mastery, is_unknown=not targets)
+
     result = choose_exercise(
         targets=targets,
         overmastered=overmastered,
         under_observed=assessment["unknown_phonemes"],
         overall_level=assessment["overall_level"],
-        confusion_hint=None,
         recently_served_ids=recently_served_ids,
         g2p_convert=g2p_convert,
         ipa_to_tokens=ipa_to_tokens,
+        exercise_type=exercise_type,
+        top_target=top_target,
+        confusion_phoneme=None,
         diagnostic=not targets,
     )
 
@@ -227,7 +267,8 @@ def provisional_assessment_from_metrics(metrics: Dict[str, float]) -> Dict[str, 
         "eligible_phoneme_count": len(clean),
         "tracked_phoneme_count": len(clean),
         "independent_recording_count": 0,
-        "confidence_interval": None,
+        "credible_interval": None,
+        "interval_method": "none_stateless_metrics",
         "weak_phonemes": weak,
         "unknown_phonemes": unknown,
         "strong_phonemes": strong,
