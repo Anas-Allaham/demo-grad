@@ -5,9 +5,9 @@ Two responsibilities:
 
   1. ``assess_user_level`` - a level assessment that refuses to invent a level
      from thin evidence. A phoneme is level-eligible only after enough
-     independent recordings across enough distinct prompts; the level is a
-     macro-average of a CONSERVATIVE (lower-bound) posterior over those
-     eligible phonemes, and the status is reported honestly
+     independent, quality-weighted recordings across enough distinct prompts;
+     the score is a posterior macro-average and the level is assigned only
+     when its credible interval stays inside one band. Status is reported honestly
      (insufficient_evidence / provisional / established).
 
   2. Confusion helpers - aggregate the learner's real substitution pairs
@@ -62,7 +62,14 @@ def _posterior_macro_interval(
 
 # ---- Eligibility (configurable, provisional) --------------------------------
 MIN_RECORDINGS_FOR_ELIGIBLE = 3      # independent recordings before a phoneme counts
+MIN_EFFECTIVE_RECORDINGS_FOR_ELIGIBLE = 2.0  # quality-weighted recording mass
 MIN_DISTINCT_PROMPTS = 2             # across at least this many different texts
+
+# Utterance-level epenthesis posterior. Its influence ramps up over the first
+# three effective recordings and is capped so phoneme mastery remains the main
+# profile signal while systematic insertions can still lower the result.
+UTTERANCE_PROFILE_MAX_WEIGHT = 0.20
+UTTERANCE_FULL_WEIGHT_EVIDENCE = 3.0
 
 # ---- Coverage -> assessment status ------------------------------------------
 PROVISIONAL_COVERAGE = 0.25          # below this: insufficient_evidence
@@ -96,7 +103,13 @@ def diagnostic_status(context_stats: Dict[str, Dict[str, int]]) -> Dict[str, Any
     covered = set()
     for phoneme, ctx in context_stats.items():
         canon = canonicalize_phoneme(phoneme)
-        if is_assessable(canon) and ctx.get("recordings", 0) >= DIAGNOSTIC_MIN_CONTEXTS:
+        recordings = ctx.get("recordings", 0)
+        effective = ctx.get("effective_recordings", recordings)
+        if (
+            is_assessable(canon)
+            and recordings >= DIAGNOSTIC_MIN_CONTEXTS
+            and effective >= DIAGNOSTIC_MIN_CONTEXTS
+        ):
             covered.add(canon)
     uncovered = ASSESSABLE_INVENTORY - covered
     needed = int(round(DIAGNOSTIC_COVERAGE_FRACTION * len(ASSESSABLE_INVENTORY)))
@@ -119,11 +132,74 @@ def _level_from_score(score: Optional[float]) -> str:
     return "advanced"
 
 
+def _level_from_interval(interval: Optional[Sequence[float]]) -> Tuple[str, List[str]]:
+    """Conservative level decision from a posterior credible interval."""
+    if interval is None:
+        return "unknown", []
+    low, high = float(interval[0]), float(interval[1])
+    if high < BEGINNER_MAX_SCORE:
+        return "beginner", []
+    if low >= INTERMEDIATE_MAX_SCORE:
+        return "advanced", []
+    if low >= BEGINNER_MAX_SCORE and high < INTERMEDIATE_MAX_SCORE:
+        return "intermediate", []
+
+    possible: List[str] = []
+    if low < BEGINNER_MAX_SCORE:
+        possible.append("beginner")
+    if high >= BEGINNER_MAX_SCORE and low < INTERMEDIATE_MAX_SCORE:
+        possible.append("intermediate")
+    if high >= INTERMEDIATE_MAX_SCORE:
+        possible.append("advanced")
+    return "uncertain", possible
+
+
+def _posterior_profile_interval(
+    alpha_betas: Sequence[Tuple[float, float]],
+    utterance_state: Optional[Dict[str, Any]] = None,
+    seed: int = MC_SEED,
+    n_samples: int = MC_SAMPLES,
+    credible_mass: float = CREDIBLE_MASS,
+) -> Tuple[float, float, float, float]:
+    """Posterior interval for phoneme macro mastery plus epenthesis state.
+
+    Returns ``(mean, low, high, utterance_weight)`` in [0, 1].
+    """
+    if not alpha_betas:
+        return (0.0, 0.0, 0.0, 0.0)
+    rng = np.random.default_rng(seed)
+    phoneme_draws = np.stack([
+        rng.beta(max(alpha, 1e-6), max(beta, 1e-6), size=n_samples)
+        for alpha, beta in alpha_betas
+    ]).mean(axis=0)
+
+    effective = float((utterance_state or {}).get("effective_recordings", 0.0))
+    utterance_weight = UTTERANCE_PROFILE_MAX_WEIGHT * min(
+        1.0, effective / UTTERANCE_FULL_WEIGHT_EVIDENCE
+    )
+    profile_draws = phoneme_draws
+    if utterance_weight > 0:
+        alpha = max(float(utterance_state.get("alpha", 1.0)), 1e-6)
+        beta = max(float(utterance_state.get("beta", 1.0)), 1e-6)
+        utterance_draws = rng.beta(alpha, beta, size=n_samples)
+        profile_draws = (1.0 - utterance_weight) * phoneme_draws + utterance_weight * utterance_draws
+
+    tail = (1.0 - credible_mass) / 2.0
+    return (
+        float(profile_draws.mean()),
+        float(np.quantile(profile_draws, tail)),
+        float(np.quantile(profile_draws, 1.0 - tail)),
+        float(utterance_weight),
+    )
+
+
 def assess_user_level(
     stats: Dict[str, "mastery.PhonemeStat"],
-    context_stats: Dict[str, Dict[str, int]],
+    context_stats: Dict[str, Dict[str, Any]],
     independent_recording_count: int,
     now: Optional[datetime] = None,
+    effective_recording_count: Optional[float] = None,
+    utterance_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Produce an evidence-aware level assessment.
 
@@ -139,13 +215,17 @@ def assess_user_level(
         if is_assessable(canon):
             tracked[canon] = stat
 
-    context: Dict[str, Dict[str, int]] = {}
+    context: Dict[str, Dict[str, Any]] = {}
     for phoneme, ctx in context_stats.items():
         canon = canonicalize_phoneme(phoneme)
         if not is_assessable(canon):
             continue
-        acc = context.setdefault(canon, {"recordings": 0, "distinct_prompts": 0, "occurrences": 0})
+        acc = context.setdefault(
+            canon,
+            {"recordings": 0, "effective_recordings": 0.0, "distinct_prompts": 0, "occurrences": 0},
+        )
         acc["recordings"] += ctx.get("recordings", 0)
+        acc["effective_recordings"] += ctx.get("effective_recordings", ctx.get("recordings", 0))
         acc["distinct_prompts"] = max(acc["distinct_prompts"], ctx.get("distinct_prompts", 0))
         acc["occurrences"] += ctx.get("occurrences", 0)
 
@@ -153,8 +233,13 @@ def assess_user_level(
     for phoneme, stat in tracked.items():
         ctx = context.get(phoneme, {})
         recordings = max(ctx.get("recordings", 0), stat.independent_attempts)
+        effective_recordings = float(ctx.get("effective_recordings", recordings))
         prompts = ctx.get("distinct_prompts", 0)
-        if recordings >= MIN_RECORDINGS_FOR_ELIGIBLE and prompts >= MIN_DISTINCT_PROMPTS:
+        if (
+            recordings >= MIN_RECORDINGS_FOR_ELIGIBLE
+            and effective_recordings >= MIN_EFFECTIVE_RECORDINGS_FOR_ELIGIBLE
+            and prompts >= MIN_DISTINCT_PROMPTS
+        ):
             eligible.append(phoneme)
 
     weak: List[Dict[str, Any]] = []
@@ -193,32 +278,60 @@ def assess_user_level(
         status = "provisional"
 
     if eligible_alpha_betas and status != "insufficient_evidence":
-        # Real posterior of the macro-average via Monte Carlo (deterministic).
-        mc_mean, mc_low, mc_high = _posterior_macro_interval(eligible_alpha_betas)
+        # Real posterior of the macro-average plus the separate utterance-level
+        # epenthesis state. Both use quality-weighted Beta evidence.
+        mc_mean, mc_low, mc_high, utterance_weight = _posterior_profile_interval(
+            eligible_alpha_betas, utterance_state=utterance_state
+        )
         pronunciation_score: Optional[float] = round(100.0 * mc_mean, 1)
         credible_interval: Optional[List[float]] = [round(100.0 * mc_low, 1), round(100.0 * mc_high, 1)]
     else:
         pronunciation_score = None
         credible_interval = None
+        utterance_weight = 0.0
+
+    overall_level, borderline_levels = _level_from_interval(credible_interval)
+    exercise_level = _level_from_score(credible_interval[0] if credible_interval else None)
+    utterance_alpha = float((utterance_state or {}).get("alpha", 1.0))
+    utterance_beta = float((utterance_state or {}).get("beta", 1.0))
+    utterance_mean = utterance_alpha / max(utterance_alpha + utterance_beta, 1e-9)
 
     return {
         "pronunciation_score": pronunciation_score,
-        "overall_level": _level_from_score(pronunciation_score),
+        "overall_level": overall_level,
+        "borderline_levels": borderline_levels,
+        "level_decision": "borderline" if overall_level == "uncertain" else overall_level,
+        "exercise_level": exercise_level,
         "assessment_status": status,
         "inventory_coverage": round(inventory_coverage, 3),
         "eligible_phoneme_count": eligible_count,
         "tracked_phoneme_count": len(tracked),
         "independent_recording_count": independent_recording_count,
+        "effective_recording_count": round(
+            float(effective_recording_count if effective_recording_count is not None else independent_recording_count),
+            3,
+        ),
         # A real Bayesian posterior credible interval for the macro-average
         # (Monte Carlo over the eligible Beta posteriors). Named accurately --
         # it is NOT a frequentist confidence interval.
         "credible_interval": credible_interval,
         "credible_mass": CREDIBLE_MASS,
-        "interval_method": "beta_posterior_monte_carlo",
+        "interval_method": "quality_weighted_beta_posterior_monte_carlo",
+        "level_decision_basis": "credible_interval",
+        "utterance_epenthesis_state": {
+            "alpha": round(utterance_alpha, 6),
+            "beta": round(utterance_beta, 6),
+            "posterior_mean": round(utterance_mean, 3),
+            "effective_recordings": round(float((utterance_state or {}).get("effective_recordings", 0.0)), 3),
+            "insertion_count": int((utterance_state or {}).get("insertion_count", 0)),
+            "profile_weight": round(utterance_weight, 3),
+        },
         "weak_phonemes": weak,
         "unknown_phonemes": unknown,
         "strong_phonemes": sorted(strong),
         "provisional": True,
+        "assessment_source": "saved_profile_evidence",
+        "raw_stateless_metrics": False,
         "note": "Provisional articulatory-distance score; not a calibrated GOP or CEFR level.",
     }
 

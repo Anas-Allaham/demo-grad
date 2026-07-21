@@ -56,12 +56,16 @@ def test_health_reports_readiness_and_trust(client):
     assert "scoring_trusted" in h and "panphon_inventory_ok" in h
     assert h["scoring_trusted"] == h["panphon_inventory_ok"]
     assert h["audio_retention_enabled"] is False
+    assert h["heteronym_resolution_active"] is True
+    assert h["heteronym_entries_checked"] == 72
 
 
 def test_g2p_route(client):
     data = client.post("/g2p", json={"text": "school"}).get_json()
     assert data["ipa"]
     assert "s" in data["ipa"]
+    assert data["heteronym_resolution_active"] is True
+    assert data["reference_g2p_trusted"] is True
 
 
 def test_practice_next_cold_start_is_diagnostic(client):
@@ -106,6 +110,14 @@ def test_analyze_unscorable_is_rejected_and_updates_no_mastery(client, monkeypat
     import db
     user = db.get_user_by_name("__routes_reject__")
     assert db.get_trusted_recording_count(user["id"]) == 0
+    assert db.get_all_phoneme_states(user["id"]) == []
+    conn = db.get_connection()
+    event_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM attempt_phoneme_events e "
+        "JOIN attempts a ON a.id=e.attempt_id WHERE a.user_id=?",
+        (user["id"],),
+    ).fetchone()["n"]
+    assert event_count == 0
 
 
 def test_analyze_response_carries_provenance(client, monkeypatch):
@@ -119,7 +131,32 @@ def test_analyze_response_carries_provenance(client, monkeypatch):
     import db
     user = db.get_user_by_name("__routes_prov__")
     conn = db.get_connection()
-    row = conn.execute("SELECT scoring_engine, scoring_trusted, mastery_updated FROM attempts "
+    row = conn.execute("SELECT scoring_engine, scoring_trusted, mastery_updated, "
+                       "g2p_mode, reference_g2p_trusted FROM attempts "
                        "WHERE user_id=?", (user["id"],)).fetchone()
     assert row["scoring_engine"] == "panphon"
     assert row["scoring_trusted"] == 1 and row["mastery_updated"] == 1
+    assert row["g2p_mode"].startswith("context_aware_")
+    assert row["reference_g2p_trusted"] == 1
+
+
+def test_untrusted_reference_never_updates_mastery(client, monkeypatch):
+    monkeypatch.setattr(flask_app, "process_recording", _scorable_result)
+    response = client.post(
+        "/analyze",
+        data={
+            "text": "They permit entry",
+            "user": "__routes_permit__",
+            "audio": (io.BytesIO(b"RIFFfake"), "rec.webm", "audio/webm"),
+        },
+        content_type="multipart/form-data",
+    ).get_json()
+
+    assert response["scorable"] is True
+    assert response["scoring_trusted"] is True
+    assert response["reference_g2p_trusted"] is False
+    assert response["unsupported_heteronyms"] == ["permit"]
+    assert response["mastery_updated"] is False
+    import db
+    user = db.get_user_by_name("__routes_permit__")
+    assert db.get_all_phoneme_states(user["id"]) == []

@@ -18,8 +18,8 @@ adaptive, confusion-aware per-phoneme practice loop.
 
 This version hardens the evidence pipeline:
 
-1. **Speech-presence audio gate** — energy is no longer enough. White noise, a
-   sine tone, a DC offset, silence, and clipping are rejected using spectral
+1. **Speech-presence audio gate** — energy is no longer enough. Steady or
+   amplitude-modulated noise/tones, a DC offset, silence, and clipping are rejected using spectral
    flatness, spectral bandwidth, zero-crossing rate, and syllable-rate envelope
    modulation. Validated against a real speech fixture (`tests/fixtures/`).
 2. **Scoring provenance & trust** — every attempt stores `scoring_engine`,
@@ -29,22 +29,26 @@ This version hardens the evidence pipeline:
    as untrusted/unknown unless explicitly migrated.
 3. **PanPhon validated at startup** — PanPhon must vectorize *every* assessable
    phoneme or the engine reports `fallback_features` (untrusted). It never
-   silently uses fallback distance while claiming `scoring_trusted=true`.
+   mixes PanPhon and fallback distances within an attempt.
    **Trusted scoring requires PanPhon** (`pip install panphon`).
 4. **Audio quality = fractional evidence** — `quality_weight` scales the Beta
    update symmetrically (less certain), never converting low quality into a
    pronunciation failure.
-5. **Real credible interval** — the macro-average now has a genuine Bayesian
+5. **Trusted contextual G2P** — all 72 bundled heteronyms are loaded before
+   either backend. Resolution works without NeMo, and unresolved/OOV/unsupported
+   references are exposed and never update mastery. `permit` is explicitly
+   unsupported because its contrast collapses in the acoustic inventory.
+6. **Real credible interval** — the macro-average now has a genuine Bayesian
    posterior **credible interval** via deterministic Monte-Carlo sampling of the
    per-phoneme Beta posteriors (renamed from the old fake "confidence interval").
-6. **Functional exercise types** — mastery drives the actual material: minimal
+7. **Functional exercise types** — mastery drives the actual material: minimal
    pairs / isolated words (low), short phrases, targeted sentences, or
    maintenance/connected speech. Retrieval is confusion-aware, not only the LLM.
-7. **Insertions tracked separately** — epenthesis affects the utterance-level
-   score but is never attributed to an expected phoneme's mastery.
-8. **Private, temporary audio** — original, converted, and reduced recordings are
-   deleted after processing unless `RETAIN_AUDIO=1`. No recordings ship.
-9. **Atomic writes** — attempt + events + mastery + assignment completion happen
+8. **Insertions tracked separately** — epenthesis updates an utterance-level
+   Beta state and affects the profile, but is never attributed to an expected phoneme.
+9. **Private, temporary audio** — original, converted, and reduced recordings are
+   deleted in an outer post-save `finally` unless `RETAIN_AUDIO=1`. No recordings ship.
+10. **Atomic writes** — attempt + events + mastery + assignment completion happen
    in one SQLite transaction; a partial failure rolls back entirely.
 
 ---
@@ -78,7 +82,7 @@ mastery** from those numbers.
 | `phoneme_vectors_professional.py` | **Single source of truth**: canonicalization, the canonical inventory (derived from the model `vocab.json`), articulatory distance (PanPhon or labelled fallback), vowel/consonant classification, alignment cost + substitution labels, soft mastery evidence, inventory validation, `scoring_engine()`. |
 | `phoneme_vectors.py` | Thin compatibility wrapper re-exporting the professional module (no second implementation). |
 | `tokenization.py` | `normalize_ipa`, `split_ipa_word`, `tokenize_reference_ipa`, `tokenize_ctc_prediction`, `ipa_to_tokens`, reading guide. |
-| `g2p_service.py` | Text → IPA (context-aware engine, or bundled dictionary fallback). No torch. |
+| `g2p_service.py` | Text → IPA plus reference trust metadata; heteronyms resolve before NeMo/dictionary fallback. No torch. |
 | `scoring.py` | DP alignment + metrics. Keeps `articulatory_distance`, `alignment_cost`, and score strictly separate. |
 | `mastery.py` | Soft, **per-recording** Beta posterior with correct half-life decay. |
 | `audio_quality.py` | The scorability gate (`AudioQualityDecision`) + `should_update_mastery`. |
@@ -156,8 +160,8 @@ other substitution            → clamp(1 − articulatory_distance, 0, 1)
 For each recording, group alignment rows by expected phoneme, then:
 ```
 mean_obs      = mean(soft evidence for that phoneme in this recording)
-α  ← α_decayed + mean_obs
-β  ← β_decayed + (1 − mean_obs)
+α  ← α_decayed + quality_weight × mean_obs
+β  ← β_decayed + quality_weight × (1 − mean_obs)
 occurrence_count    += (number of occurrences this recording)
 independent_attempts += 1               # exactly once per recording
 ```
@@ -175,16 +179,22 @@ Decay is applied **on read** (ranking, display, level assessment, mastered
 checks), so stale skills decay in real time.
 
 ### Evidence-aware level (provisional; **not** CEFR)
-A phoneme is *level-eligible* only after **≥ 3 independent, trusted recordings**
-across **≥ 2 distinct prompts** (only recordings that were scorable AND scored
-by a trusted PanPhon engine count). The score is the **posterior mean of the
-macro-average** over eligible phonemes, with a real **credible interval** from
-Monte-Carlo sampling of the per-phoneme Beta posteriors:
+A phoneme is *level-eligible* only after **≥ 3 independent, trusted recordings**,
+**≥ 2.0 quality-weighted effective recordings**, and **≥ 2 distinct prompts**.
+Only scorable recordings with trusted PanPhon scoring and a trusted reference
+G2P count. Insertions form a separate utterance-level posterior:
 ```
-pronunciation_score = 100 × E[ mean(sample_i(phoneme) for eligible phonemes) ]   # MC posterior mean
-credible_interval   = 100 × [q2.5, q97.5] of that macro-average distribution     # 95% Bayesian CI
-overall_level       = beginner (<55) | intermediate (<78) | advanced (≥78)       # provisional thresholds
-assessment_status   = insufficient_evidence | provisional | established          # by inventory coverage
+epenthesis_obs       = max(0, 1 − insertion_count / reference_unit_count)
+α_utt               = 1 + Σ quality_weight × epenthesis_obs
+β_utt               = 1 + Σ quality_weight × (1 − epenthesis_obs)
+utterance_weight     = 0.20 × min(1, effective_recordings / 3)
+profile_draw         = (1 − utterance_weight) × phoneme_macro_draw
+                       + utterance_weight × Beta(α_utt, β_utt) draw
+pronunciation_score  = 100 × E[profile_draw]
+credible_interval    = 100 × [q2.5, q97.5] of profile_draw
+overall_level        = one band only when the whole interval is inside it;
+                       otherwise "uncertain" with borderline_levels
+assessment_status    = insufficient_evidence | provisional | established
 ```
 Too little coverage → `insufficient_evidence` and `overall_level = "unknown"`
 (the app never invents a level). The Monte-Carlo is deterministic (fixed seed).
@@ -198,7 +208,7 @@ conda create -n pronunciation-app python=3.10 -y
 conda activate pronunciation-app
 
 pip install -r requirements-minimal.txt        # demo install
-# or full (NeMo/spaCy context-aware G2P):
+# or full (optional NeMo/spaCy backend improvements):
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
@@ -207,7 +217,10 @@ python -m spacy download en_core_web_sm
    `model/my_wav2vec2_phoneme_model/` (`config.json`, `vocab.json`,
    `tokenizer_config.json`, `preprocessor_config.json`, `model.safetensors`).
    The large `model.safetensors` is gitignored — copy it in.
-2. **FFmpeg** (for browser `.webm`/`.ogg` → 16 kHz mono WAV): install and add to PATH.
+2. **FFmpeg** (for browser `.webm`/`.ogg`/mobile audio -> 16 kHz mono WAV):
+   the app can use the `imageio-ffmpeg` Python package from the requirements.
+   If decoding still fails on Windows/Conda, install the system binary with:
+   `conda install -c conda-forge ffmpeg -y`, then restart `python app.py`.
 3. **Optional LLM generation**: copy `.env.example` → `.env` and add
    `GEMINI_API_KEY`. Without a key the app runs retrieval-only. **Never commit `.env`.**
 

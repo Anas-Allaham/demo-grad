@@ -3,6 +3,7 @@ transformers
 torch
 librosa
 soundfile
+imageio-ffmpeg
 numpy
 noisereduce
 panphon

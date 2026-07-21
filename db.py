@@ -118,6 +118,10 @@ COLUMN_MIGRATIONS: Dict[str, List[tuple]] = {
         ("scoring_trusted", "INTEGER NOT NULL DEFAULT 0"),
         ("mastery_updated", "INTEGER NOT NULL DEFAULT 0"),
         ("insertion_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("reference_unit_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("g2p_mode", "TEXT"),
+        ("reference_g2p_trusted", "INTEGER NOT NULL DEFAULT 0"),
+        ("reference_g2p_reason", "TEXT"),
     ],
 }
 
@@ -283,6 +287,10 @@ def _insert_attempt(
     scoring_trusted: bool = False,
     mastery_updated: bool = False,
     insertion_count: int = 0,
+    reference_unit_count: int = 0,
+    g2p_mode: Optional[str] = None,
+    reference_g2p_trusted: bool = False,
+    reference_g2p_reason: Optional[str] = None,
 ) -> int:
     """Insert one attempt row WITHOUT committing (transaction-friendly)."""
     cur = conn.execute(
@@ -290,14 +298,16 @@ def _insert_attempt(
            (user_id, exercise_id, text, reference_ipa, predicted_ipa,
             phoneme_error_rate, weighted_error, raw_weighted_per,
             quality_weight, scorable, rejected_reason,
-            scoring_engine, scoring_trusted, mastery_updated, insertion_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            scoring_engine, scoring_trusted, mastery_updated, insertion_count,
+            reference_unit_count, g2p_mode, reference_g2p_trusted, reference_g2p_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             user_id, exercise_id, text, reference_ipa, predicted_ipa,
             phoneme_error_rate, weighted_error, raw_weighted_per,
             quality_weight, 1 if scorable else 0, rejected_reason,
             scoring_engine, 1 if scoring_trusted else 0,
-            1 if mastery_updated else 0, insertion_count,
+            1 if mastery_updated else 0, insertion_count, reference_unit_count,
+            g2p_mode, 1 if reference_g2p_trusted else 0, reference_g2p_reason,
         ),
     )
     return cur.lastrowid
@@ -506,6 +516,11 @@ def get_sentence_by_id(sentence_id: int, conn: Optional[sqlite3.Connection] = No
     return conn.execute("SELECT * FROM exercise_bank WHERE id = ?", (sentence_id,)).fetchone()
 
 
+def get_sentence_by_text(text: str, conn: Optional[sqlite3.Connection] = None) -> Optional[sqlite3.Row]:
+    conn = conn or get_connection()
+    return conn.execute("SELECT * FROM exercise_bank WHERE text = ?", (text,)).fetchone()
+
+
 def update_sentence_tags(
     sentence_id: int,
     reference_ipa: str,
@@ -661,31 +676,43 @@ def _trusted_filter() -> str:
 
 def get_phoneme_context_stats(
     user_id: int, conn: Optional[sqlite3.Connection] = None
-) -> Dict[str, Dict[str, int]]:
+) -> Dict[str, Dict[str, Any]]:
     """Per expected phoneme: how many independent recordings it appeared in
     and across how many distinct prompt texts. Used by evidence-aware level
     eligibility (>= N recordings across >= M prompts)."""
     conn = conn or get_connection()
     rows = conn.execute(
         f"""SELECT e.expected_phoneme AS phoneme,
-                   COUNT(DISTINCT a.id) AS recordings,
-                   COUNT(DISTINCT a.text) AS distinct_prompts,
-                   COUNT(*) AS occurrences
+                   a.id AS attempt_id,
+                   a.text AS prompt_text,
+                   COALESCE(a.quality_weight, 1.0) AS quality_weight
             FROM attempt_phoneme_events e
             JOIN attempts a ON e.attempt_id = a.id
             WHERE a.user_id = ?
               AND e.expected_phoneme IS NOT NULL
-              AND {_trusted_filter()}
-            GROUP BY e.expected_phoneme""",
+              AND {_trusted_filter()}""",
         (user_id,),
     ).fetchall()
+    accumulated: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        state = accumulated.setdefault(
+            row["phoneme"],
+            {"attempt_ids": set(), "prompt_texts": set(), "attempt_weights": {}, "occurrences": 0},
+        )
+        state["attempt_ids"].add(row["attempt_id"])
+        state["prompt_texts"].add(row["prompt_text"])
+        state["attempt_weights"][row["attempt_id"]] = max(
+            0.0, min(1.0, float(row["quality_weight"]))
+        )
+        state["occurrences"] += 1
     return {
-        row["phoneme"]: {
-            "recordings": row["recordings"],
-            "distinct_prompts": row["distinct_prompts"],
-            "occurrences": row["occurrences"],
+        phoneme: {
+            "recordings": len(state["attempt_ids"]),
+            "effective_recordings": round(sum(state["attempt_weights"].values()), 6),
+            "distinct_prompts": len(state["prompt_texts"]),
+            "occurrences": state["occurrences"],
         }
-        for row in rows
+        for phoneme, state in accumulated.items()
     }
 
 
@@ -727,3 +754,68 @@ def get_trusted_recording_count(user_id: int, conn: Optional[sqlite3.Connection]
         (user_id,),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def get_effective_recording_count(user_id: int, conn: Optional[sqlite3.Connection] = None) -> float:
+    """Quality-weighted trusted recording evidence for a saved profile."""
+    conn = conn or get_connection()
+    row = conn.execute(
+        f"""SELECT COALESCE(SUM(
+                    CASE
+                        WHEN a.quality_weight IS NULL THEN 1.0
+                        WHEN a.quality_weight < 0 THEN 0.0
+                        WHEN a.quality_weight > 1 THEN 1.0
+                        ELSE a.quality_weight
+                    END
+                ), 0.0) AS n
+            FROM attempts a
+            WHERE a.user_id = ? AND {_trusted_filter()}""",
+        (user_id,),
+    ).fetchone()
+    return float(row["n"]) if row else 0.0
+
+
+def get_utterance_epenthesis_state(
+    user_id: int, conn: Optional[sqlite3.Connection] = None
+) -> Dict[str, Any]:
+    """Build a quality-weighted Beta state for insertion-free utterances.
+
+    The observation for one recording is ``max(0, 1 - insertions/ref_units)``.
+    It lives at utterance level; no inserted phoneme is assigned to a reference
+    phoneme or written into per-phoneme mastery.
+    """
+    conn = conn or get_connection()
+    rows = conn.execute(
+        f"""SELECT a.id, a.insertion_count, a.reference_unit_count,
+                   COALESCE(a.quality_weight, 1.0) AS quality_weight,
+                   (SELECT COUNT(*) FROM attempt_phoneme_events e
+                    WHERE e.attempt_id = a.id AND e.expected_phoneme IS NOT NULL) AS event_ref_units
+            FROM attempts a
+            WHERE a.user_id = ? AND {_trusted_filter()}""",
+        (user_id,),
+    ).fetchall()
+
+    alpha = beta = 1.0
+    effective_evidence = 0.0
+    total_insertions = 0
+    included = 0
+    for row in rows:
+        reference_units = int(row["reference_unit_count"] or row["event_ref_units"] or 0)
+        if reference_units <= 0:
+            continue
+        insertions = max(0, int(row["insertion_count"] or 0))
+        weight = max(0.0, min(1.0, float(row["quality_weight"])))
+        observation = max(0.0, 1.0 - (insertions / reference_units))
+        alpha += weight * observation
+        beta += weight * (1.0 - observation)
+        effective_evidence += weight
+        total_insertions += insertions
+        included += 1
+
+    return {
+        "alpha": alpha,
+        "beta": beta,
+        "recordings": included,
+        "effective_recordings": round(effective_evidence, 6),
+        "insertion_count": total_insertions,
+    }

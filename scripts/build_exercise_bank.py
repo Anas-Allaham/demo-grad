@@ -24,7 +24,7 @@ if str(BASE_DIR) not in sys.path:
 
 import content  # noqa: E402
 import db  # noqa: E402
-from g2p_service import g2p_convert, load_g2p_engine  # noqa: E402
+from g2p_service import g2p_convert_with_metadata, load_g2p_engine  # noqa: E402
 from phoneme_vectors_professional import (  # noqa: E402
     ASSESSABLE_INVENTORY,
     canonicalize_phoneme,
@@ -60,7 +60,10 @@ def retag_existing_bank():
     old bank tagged by a previous tokenizer becomes consistent again."""
     retagged = 0
     for sentence in db.get_all_sentences():
-        reference_ipa = g2p_convert(sentence["text"])
+        resolution = g2p_convert_with_metadata(sentence["text"])
+        if not resolution.reference_g2p_trusted:
+            continue
+        reference_ipa = resolution.ipa
         counts = dict(Counter(ipa_to_tokens(reference_ipa)))
         if not counts:
             continue
@@ -85,7 +88,7 @@ def main():
     rejected_examples = []
 
     for text in sentences:
-        tagged = content.tag_sentence(text, g2p_convert, ipa_to_tokens)
+        tagged = content.tag_sentence(text, g2p_convert_with_metadata, ipa_to_tokens)
         if not content.is_valid_tagging(tagged):
             skipped += 1
             if len(rejected_examples) < 10:

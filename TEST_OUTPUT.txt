@@ -1,34 +1,81 @@
-# Exact verification output
+# Exact final verification output
 
 ## Environment
-Python 3.13.9
-panphon: installed 0.22.2
-scoring_engine: panphon | scoring_trusted: True | panphon validated: True
+Python: 3.13.9
+Platform: win32
+pytest: 9.1.1
+numpy: 2.3.5
+panphon: 0.22.2
+scipy: 1.17.1
+soundfile: 0.13.1
+librosa: 0.11.0
+flask: 3.1.3
+torch: 2.11.0
+transformers: 5.7.0
+scoring_engine: panphon
+scoring_trusted: True
+panphon_inventory: {'ok': True, 'engine': 'panphon', 'failures': [], 'checked': 40, 'reason': ''}
 
-## python -m compileall .
-compileall: OK (exit 0)
+## python -m compileall -q .
+Exit code: 0
+stdout: <empty>
+stderr: <empty>
 
-## pytest -v
+## python -m pytest -v
 ============================= test session starts =============================
 platform win32 -- Python 3.13.9, pytest-9.1.1, pluggy-1.5.0
 rootdir: C:\projects\test-demo\pronunciation_web_app_g2p_integrated\pronunciation_web_app_integrated
 configfile: pytest.ini
 testpaths: tests
 plugins: anyio-4.12.0, typeguard-4.5.1
-collected 62 items
+collected 94 items
 
-tests\test_assessment.py ....                                            [  6%]
-tests\test_audio_and_degraded.py ...                                     [ 11%]
+tests\test_assessment.py ....                                            [  4%]
+tests\test_assessment_consistency.py .......                             [ 11%]
+tests\test_audio_and_degraded.py ...                                     [ 14%]
 tests\test_audit_exercises.py .......                                    [ 22%]
-tests\test_audit_persistence.py .....                                    [ 30%]
-tests\test_audit_quality_interval.py ....                                [ 37%]
-tests\test_audit_routes.py ......                                        [ 46%]
-tests\test_audit_speech_gate.py ......                                   [ 56%]
-tests\test_audit_trust.py .....                                          [ 64%]
-tests\test_content_and_build.py ....                                     [ 70%]
-tests\test_mastery.py ......                                             [ 80%]
-tests\test_scoring.py ....                                               [ 87%]
-tests\test_single_canonicalizer.py ...                                   [ 91%]
+tests\test_audit_persistence.py .....                                    [ 27%]
+tests\test_audit_quality_interval.py ....                                [ 31%]
+tests\test_audit_routes.py .......                                       [ 39%]
+tests\test_audit_speech_gate.py ............                             [ 52%]
+tests\test_audit_trust.py .....                                          [ 57%]
+tests\test_cleanup_failures.py ......                                    [ 63%]
+tests\test_content_and_build.py ......                                   [ 70%]
+tests\test_g2p_heteronyms.py ........                                    [ 78%]
+tests\test_mastery.py ......                                             [ 85%]
+tests\test_packaging.py ..                                               [ 87%]
+tests\test_scoring.py ....                                               [ 91%]
+tests\test_single_canonicalizer.py ...                                   [ 94%]
 tests\test_tokenization.py .....                                         [100%]
 
-============================= 62 passed in 20.34s =============================
+============================= 94 passed in 20.74s =============================
+
+## Dictionary-only heteronym context probe
+word|context_a_word_ipa|context_b_word_ipa|trusted_a|trusted_b|status
+read|ɹid|ɹɛd|True|True|resolved
+record|ɹɪkɔɹd|ɹɛkɝd|True|True|resolved
+present|pɹɪzɛnt|pɹɛzənt|True|True|resolved
+use|juz|jus|True|True|resolved
+refuse|ɹɪfjuz|ɹɛfjus|True|True|resolved
+close|kloʊz|kloʊs|True|True|resolved
+permit|pɚmɪt|pɝmɪt|False|False|unsupported_canonical_collapse
+validation: {'checked': 72, 'valid_entries': 72, 'invalid_entries': [], 'unsupported_phonemes': {}, 'unsupported_contrasts': ['permit'], 'schema_and_inventory_ok': True, 'fully_supported': False}
+
+## Adversarial audio probe
+case|scorable|reasons|clipping_ratio|flatness|modulation
+silence|False|very_low_level,silent,insufficient_voiced_speech,insufficient_speech_span,no_speech_modulation,noise_like_spectrum,dc_or_subsonic|0.0|1.0|0.0
+dc|False|very_low_level,insufficient_voiced_speech,insufficient_speech_span,no_speech_modulation,noise_like_spectrum,dc_or_subsonic|0.0|1.0|0.0
+steady_noise|False|no_speech_modulation,noise_like_spectrum|0.0008|0.9712|0.0505
+modulated_noise|False|noise_like_spectrum|0.0002|0.9688|0.5201
+steady_tone|False|no_speech_modulation,tonal_not_speech|0.0|0.0|0.0
+modulated_tone|False|tonal_not_speech|0.0|0.0|0.5218
+clipped_speech|False|clipping|0.0656|0.3109|0.3616
+real_speech|True|-|0.0|0.1917|0.4997
+speech_dc_offset|True|-|0.0|0.1917|0.4997
+mains_hum_only|False|no_speech_modulation,tonal_not_speech|0.0|0.0|0.0014
+speech_plus_hum|True|-|0.0|0.0779|0.245
+
+## python scripts/package_release.py
+Archive: C:\projects\test-demo\pronunciation_web_app_g2p_integrated\pronunciation_web_app_integrated_corrected.zip
+Manifest validation: OK (66 hashed members; all hashes and sizes match)
+Exclusions: OK (no secrets, user DB, uploaded recordings, model weights, or caches)

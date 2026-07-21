@@ -178,6 +178,7 @@ def calculate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "deletions": deletions,
         "insertions": insertions,
         "insertion_count": insertions,
+        "reference_unit_count": total_reference_units,
         "insertion_rate": round(insertion_rate, 3),
         "insertion_penalty": round(insertion_penalty, 3),
         "weighted_error": round(weighted_error, 3),

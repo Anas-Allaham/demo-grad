@@ -19,7 +19,10 @@ def test_incomplete_panphon_is_not_trusted(monkeypatch):
 
     real_vector = p.phoneme_vector
 
+    vector_calls = []
+
     def flaky_vector(ph):
+        vector_calls.append(p.canonicalize_phoneme(ph))
         if p.canonicalize_phoneme(ph) == "s":
             raise ValueError("simulated PanPhon gap")
         return real_vector(ph)
@@ -32,6 +35,12 @@ def test_incomplete_panphon_is_not_trusted(monkeypatch):
         assert "s" in report["failures"]
         assert p.scoring_engine() == "fallback_features"
         assert p.scoring_trusted() is False
+        # Once global validation fails, even pairs PanPhon could vectorize use
+        # fallback features. The attempt cannot silently mix engines.
+        vector_calls.clear()
+        distance = p.articulatory_distance("t", "d")
+        assert 0.0 <= distance <= 1.0
+        assert vector_calls == []
     finally:
         p.validate_panphon_inventory.cache_clear()  # restore real validation
 
@@ -41,7 +50,10 @@ def test_trust_columns_present_and_default_untrusted(temp_db):
     db = temp_db
     conn = db.get_connection()
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(attempts)").fetchall()}
-    for col in ("scoring_engine", "scoring_trusted", "mastery_updated", "insertion_count"):
+    for col in (
+        "scoring_engine", "scoring_trusted", "mastery_updated", "insertion_count",
+        "reference_unit_count", "g2p_mode", "reference_g2p_trusted", "reference_g2p_reason",
+    ):
         assert col in cols
     ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(attempt_phoneme_events)").fetchall()}
     assert "scoring_engine" in ev_cols

@@ -29,10 +29,36 @@ def test_sine_tone_rejected():
     assert "tonal_not_speech" in d.reasons
 
 
+def test_amplitude_modulated_white_noise_rejected():
+    rng = np.random.default_rng(7)
+    t = np.arange(2 * SR) / SR
+    envelope = 0.15 + 0.85 * (0.5 + 0.5 * np.sin(2 * np.pi * 4 * t))
+    d = _rejected(envelope * rng.normal(0, 0.3, len(t)))
+    assert d.metrics["envelope_modulation"] > 0.2
+    assert d.scorable is False
+    assert "noise_like_spectrum" in d.reasons
+
+
+def test_amplitude_modulated_sine_tone_rejected():
+    t = np.arange(2 * SR) / SR
+    envelope = 0.15 + 0.85 * (0.5 + 0.5 * np.sin(2 * np.pi * 4 * t))
+    d = _rejected(envelope * 0.6 * np.sin(2 * np.pi * 440 * t))
+    assert d.metrics["envelope_modulation"] > 0.2
+    assert d.scorable is False
+    assert "tonal_not_speech" in d.reasons
+
+
 def test_dc_signal_rejected():
     d = _rejected(0.5 * np.ones(2 * SR))
     assert d.scorable is False
     assert "dc_or_subsonic" in d.reasons or "tonal_not_speech" in d.reasons
+
+
+def test_mains_hum_without_speech_rejected():
+    t = np.arange(2 * SR) / SR
+    d = _rejected(0.25 * np.sin(2 * np.pi * 60 * t))
+    assert d.scorable is False
+    assert "tonal_not_speech" in d.reasons
 
 
 def test_silence_rejected():
@@ -43,6 +69,15 @@ def test_silence_rejected():
 def test_clipping_rejected():
     t = np.arange(2 * SR) / SR
     d = _rejected(np.clip(3.0 * np.sin(2 * np.pi * 300 * t), -1, 1))
+    assert d.scorable is False
+    assert "clipping" in d.reasons
+
+
+def test_clipped_real_speech_is_rejected_by_clipping_gate():
+    audio, sr = _speech()
+    d = analyze_audio_quality(np.clip(8.0 * audio, -1.0, 1.0), sr)
+    assert d.metrics["clipping_ratio"] > 0.02
+    assert d.metrics["envelope_modulation"] > 0.2
     assert d.scorable is False
     assert "clipping" in d.reasons
 

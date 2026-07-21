@@ -227,7 +227,7 @@ def _has_oov_fallback_words(text: str, reference_ipa: str) -> bool:
 
 def tag_sentence(
     text: str,
-    g2p_convert: Callable[[str], str],
+    g2p_convert: Callable[[str], object],
     ipa_to_tokens: Callable[[str], List[str]],
 ) -> Dict:
     """Run the app's own G2P pipeline over `text` and record what it
@@ -237,7 +237,16 @@ def tag_sentence(
     length) rather than a validated CEFR classifier -- it's documented here
     as an approximation, not asserted as linguistically calibrated.
     """
-    reference_ipa = g2p_convert(text)
+    converted = g2p_convert(text)
+    if hasattr(converted, "ipa"):
+        reference_ipa = str(getattr(converted, "ipa"))
+        reference_g2p_trusted = bool(getattr(converted, "reference_g2p_trusted", False))
+        g2p_mode = str(getattr(converted, "g2p_mode", "unknown"))
+    else:
+        # Backward-compatible callback shape used by existing integrations.
+        reference_ipa = str(converted)
+        reference_g2p_trusted = None
+        g2p_mode = None
     tokens = ipa_to_tokens(reference_ipa)
     phoneme_counts = dict(Counter(tokens))
     words = text.split()
@@ -251,6 +260,8 @@ def tag_sentence(
         "word_count": word_count,
         "level_proxy": level_proxy,
         "has_oov_words": _has_oov_fallback_words(text, reference_ipa),
+        "reference_g2p_trusted": reference_g2p_trusted,
+        "g2p_mode": g2p_mode,
     }
 
 
@@ -259,6 +270,8 @@ def is_valid_tagging(tagged: Dict) -> bool:
     empty output, or at least one word that fell through to the
     out-of-vocabulary raw-spelling fallback (see `_has_oov_fallback_words`)."""
     if not tagged.get("phoneme_counts"):
+        return False
+    if tagged.get("reference_g2p_trusted") is False:
         return False
     return not tagged.get("has_oov_words", False)
 
@@ -447,9 +460,9 @@ def llm_available() -> bool:
 
 
 _LEVEL_GUIDANCE = {
-    "beginner": "Use short, common, everyday words and simple grammar (CEFR A1-A2 style).",
-    "intermediate": "Use moderately varied vocabulary and natural sentence structure (CEFR B1-B2 style).",
-    "advanced": "You may use richer vocabulary and more complex structure (CEFR C1 style).",
+    "beginner": "Use short, common, everyday words and simple grammar.",
+    "intermediate": "Use moderately varied vocabulary and natural sentence structure.",
+    "advanced": "You may use richer vocabulary and more complex structure.",
     "unknown": "Use clear, natural, everyday language of moderate difficulty.",
 }
 

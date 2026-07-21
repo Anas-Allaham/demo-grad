@@ -239,23 +239,26 @@ def analyze_audio_quality(audio: np.ndarray, sr: int) -> AudioQualityDecision:
         reasons.append("excessive_internal_dropout")
 
     # ---- Speech-presence gates (energy alone is not speech) ----
-    # Envelope modulation is the PRIMARY discriminator: real speech has strong
-    # syllable-rate modulation (~0.5); white noise, tones, and DC are steady
-    # (~0). The spectral checks only add a specific reason for a STEADY signal,
-    # so genuine, modulated speech is never rejected on spectral shape alone.
+    # Each discriminator is independent. In particular, amplitude modulation
+    # can make noise or a sine tone look speech-like in the envelope domain;
+    # it must not disable the spectral/tonality gates.
     if speech is not None:
         if speech["envelope_modulation"] < SPEECH_MODULATION_MIN:
-            reasons.append("no_speech_modulation")       # steady: not speech
-            if speech["spectral_flatness"] > SPEECH_FLATNESS_MAX:
-                reasons.append("noise_like_spectrum")    # white noise
-            if speech["spectral_flatness"] < SPEECH_FLATNESS_MIN or speech["spectral_bandwidth"] < SPEECH_BANDWIDTH_MIN:
-                reasons.append("tonal_not_speech")       # pure sine tone
-            if speech["zero_crossing_rate"] < SPEECH_ZCR_MIN:
-                reasons.append("dc_or_subsonic")         # DC offset / sub-sonic
+            reasons.append("no_speech_modulation")
+        if speech["spectral_flatness"] > SPEECH_FLATNESS_MAX:
+            reasons.append("noise_like_spectrum")
+        if (
+            speech["spectral_flatness"] < SPEECH_FLATNESS_MIN
+            or speech["spectral_bandwidth"] < SPEECH_BANDWIDTH_MIN
+        ):
+            reasons.append("tonal_not_speech")
+        if speech["zero_crossing_rate"] < SPEECH_ZCR_MIN:
+            reasons.append("dc_or_subsonic")
 
     # Fatal reasons make the recording unscorable outright.
     fatal = {
         "empty_audio", "silent", "too_short", "too_long", "very_low_level",
+        "clipping",
         "insufficient_voiced_speech", "insufficient_speech_span",
         "excessive_internal_dropout",
         "no_speech_modulation", "noise_like_spectrum", "tonal_not_speech",

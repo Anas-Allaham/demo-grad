@@ -3,6 +3,7 @@ transformers
 torch
 librosa
 soundfile
+imageio-ffmpeg
 numpy
 noisereduce
 # PanPhon is REQUIRED for trusted scoring (the app validates that it can

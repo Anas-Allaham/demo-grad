@@ -49,6 +49,13 @@ def test_difficulty_matches_level():
     assert score(hard_proxy, advanced_d) > score(easy_proxy, advanced_d)
 
 
+def test_recent_exercise_is_avoided_when_an_alternative_exists():
+    recent = {"id": 1, "phoneme_counts": {"s": 3}, "word_count": 8, "level_proxy": 10.0}
+    fresh = {"id": 2, "phoneme_counts": {"s": 2}, "word_count": 8, "level_proxy": 10.0}
+    picked = content.pick_next_sentence([recent, fresh], ["s"], recently_served_ids={1})
+    assert picked["id"] == 2
+
+
 # 16. The exercise-bank builder locates the seed file.
 def _load_builder():
     spec = importlib.util.spec_from_file_location(
@@ -66,3 +73,12 @@ def test_builder_locates_seed_file():
     sentences = builder.load_seed_sentences()
     assert len(sentences) > 0
     assert all(isinstance(s, str) and s for s in sentences)
+
+
+def test_exercise_tagging_rejects_untrusted_reference_g2p():
+    from g2p_service import g2p_convert_with_metadata
+    from tokenization import ipa_to_tokens
+
+    tagged = content.tag_sentence("They permit entry", g2p_convert_with_metadata, ipa_to_tokens)
+    assert tagged["reference_g2p_trusted"] is False
+    assert content.is_valid_tagging(tagged) is False

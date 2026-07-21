@@ -430,14 +430,11 @@ def _fallback_distance(a: str, b: str) -> float:
 
 
 def is_vowel(phoneme: str) -> bool:
-    """Major-class check. Uses PanPhon's syllabic feature when available,
-    otherwise the canonical vowel set."""
-    ft = _feature_table()
-    if ft is not None:
-        try:
-            return phoneme_features(phoneme).get("syl", 0.0) > 0.25
-        except Exception:
-            pass
+    """Major-class check from the app's validated canonical inventory.
+
+    Keeping this policy inventory-based also prevents an incomplete PanPhon
+    installation from affecting only some rows in an alignment attempt.
+    """
     return canonicalize_phoneme(phoneme) in VOWEL_PHONEMES
 
 
@@ -463,12 +460,12 @@ def articulatory_distance(a: str, b: str) -> float:
     b = canonicalize_phoneme(b)
     if a == b:
         return 0.0
-    if not panphon_available():
+    # The engine is selected globally for the attempt. If startup validation
+    # found even one PanPhon inventory gap, every pair uses fallback features;
+    # never mix per-pair engines under one fallback provenance label.
+    if not scoring_trusted():
         return _fallback_distance(a, b)
-    try:
-        return _weighted_l1_distance(phoneme_vector(a), phoneme_vector(b))
-    except Exception:
-        return _fallback_distance(a, b)
+    return _weighted_l1_distance(phoneme_vector(a), phoneme_vector(b))
 
 
 # Public name kept stable for existing callers.

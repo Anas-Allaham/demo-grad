@@ -21,6 +21,7 @@ exact G2P path the learner is later scored against.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -55,7 +56,16 @@ def assess_profile(user_id: int, now: Optional[datetime] = None) -> Dict[str, An
     stats = load_profile_stats(user_id)
     context_stats = db.get_phoneme_context_stats(user_id)
     recording_count = db.get_trusted_recording_count(user_id)
-    return assessment_mod.assess_user_level(stats, context_stats, recording_count, now=now)
+    effective_recording_count = db.get_effective_recording_count(user_id)
+    utterance_state = db.get_utterance_epenthesis_state(user_id)
+    return assessment_mod.assess_user_level(
+        stats,
+        context_stats,
+        recording_count,
+        now=now,
+        effective_recording_count=effective_recording_count,
+        utterance_state=utterance_state,
+    )
 
 
 def _confusion_hint_for(target: Optional[str], confusion_pairs: List[Dict[str, Any]]) -> Optional[str]:
@@ -205,6 +215,11 @@ def generate_exercise(
         if new_id is not None:
             gen["id"] = new_id
             exercise = gen
+        else:
+            existing = db.get_sentence_by_text(gen["text"])
+            if existing is not None:
+                gen["id"] = existing["id"]
+                exercise = gen
 
     if exercise is None:
         return {
@@ -216,6 +231,96 @@ def generate_exercise(
     return {
         "assessment": assessment,
         "source_mode": result["source_mode"],
+        "target_phonemes": targets,
+        "exercise": {
+            "sentence_id": exercise["id"],
+            "text": exercise["text"],
+            "reference_ipa": exercise["reference_ipa"],
+        },
+    }
+
+
+def generate_exercise_for_profile(
+    user_id: int,
+    g2p_convert: Callable[[str], Any],
+    ipa_to_tokens: Callable[[str], List[str]],
+    recently_served_ids: Optional[set] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Saved-profile exercise path using the authoritative assessment.
+
+    Unlike the raw metrics API, this keeps posterior intervals, evidence
+    eligibility, unknown coverage, quality weights, epenthesis state, and
+    confusion history intact.
+    """
+    now = now or datetime.now(timezone.utc)
+    recently_served_ids = recently_served_ids or set()
+    assessment = assess_profile(user_id, now=now)
+    stats = load_profile_stats(user_id)
+    diagnostic = assessment_mod.diagnostic_status(db.get_phoneme_context_stats(user_id))
+    targets = [] if diagnostic["in_diagnostic"] else [
+        item["phoneme"] for item in assessment["weak_phonemes"]
+    ][: content.MIN_TARGET_REPETITIONS + 1]
+    overmastered = sorted(mastery.get_overmastered_phonemes(stats, now=now))
+    top_target = targets[0] if targets else None
+    confusion = assessment_mod.main_confusion_for(
+        top_target, db.get_confusion_pairs(user_id)
+    ) if top_target else None
+    confusion_phoneme = confusion["spoken"] if confusion else None
+    top_mastery = mastery.posterior_mean(stats[top_target], now=now) if top_target in stats else None
+    exercise_type = (
+        "diagnostic"
+        if diagnostic["in_diagnostic"]
+        else assessment_mod.exercise_type_for_mastery(top_mastery, is_unknown=not targets)
+    )
+
+    selection = choose_exercise(
+        targets=targets,
+        overmastered=overmastered,
+        under_observed=diagnostic["uncovered"],
+        overall_level=assessment.get("exercise_level", assessment["overall_level"]),
+        recently_served_ids=recently_served_ids,
+        g2p_convert=g2p_convert,
+        ipa_to_tokens=ipa_to_tokens,
+        exercise_type=exercise_type,
+        top_target=top_target,
+        confusion_phoneme=confusion_phoneme,
+        diagnostic=diagnostic["in_diagnostic"] or not targets,
+    )
+
+    exercise = selection["exercise"]
+    if selection["generated"] is not None:
+        generated = selection["generated"]
+        new_id = db.insert_sentence(
+            text=generated["text"],
+            reference_ipa=generated["reference_ipa"],
+            word_count=generated["word_count"],
+            level_proxy=generated["level_proxy"],
+            phoneme_counts=generated["phoneme_counts"],
+            source=generated.get("source", "llm_generated"),
+        )
+        if new_id is not None:
+            generated["id"] = new_id
+            exercise = generated
+        else:
+            existing = db.get_sentence_by_text(generated["text"])
+            if existing is not None:
+                generated["id"] = existing["id"]
+                exercise = generated
+
+    if exercise is None:
+        return {
+            "assessment": assessment,
+            "exercise": None,
+            "error": "No exercises available. Run scripts/build_exercise_bank.py to populate the bank.",
+        }
+
+    confusion_hint = _confusion_hint_for(top_target, db.get_confusion_pairs(user_id))
+    return {
+        "assessment": assessment,
+        "source_mode": selection["source_mode"],
+        "exercise_type": exercise_type,
+        "confusion_hint": confusion_hint,
         "target_phonemes": targets,
         "exercise": {
             "sentence_id": exercise["id"],
@@ -237,8 +342,9 @@ def provisional_assessment_from_metrics(metrics: Dict[str, float]) -> Dict[str, 
     clean: Dict[str, float] = {}
     for phoneme, score in (metrics or {}).items():
         canon = canonicalize_phoneme(phoneme)
-        if canon and is_assessable(canon):
-            clean[canon] = float(score)
+        numeric = float(score)
+        if canon and is_assessable(canon) and math.isfinite(numeric):
+            clean[canon] = max(0.0, min(1.0, numeric))
 
     weak = sorted(
         ({"phoneme": p, "mastery": round(s, 3), "lower_confidence_bound": round(s, 3)}
@@ -262,18 +368,25 @@ def provisional_assessment_from_metrics(metrics: Dict[str, float]) -> Dict[str, 
     return {
         "pronunciation_score": score,
         "overall_level": level,
+        "exercise_level": level,
+        "borderline_levels": [],
+        "level_decision": level,
+        "level_decision_basis": "raw_mean_no_interval",
         "assessment_status": status,
         "inventory_coverage": round(len(clean) / max(len(ASSESSABLE_INVENTORY), 1), 3),
         "eligible_phoneme_count": len(clean),
         "tracked_phoneme_count": len(clean),
         "independent_recording_count": 0,
+        "effective_recording_count": 0.0,
         "credible_interval": None,
         "interval_method": "none_stateless_metrics",
         "weak_phonemes": weak,
         "unknown_phonemes": unknown,
         "strong_phonemes": strong,
         "provisional": True,
-        "note": "Provisional level from supplied scores only (no evidence counts).",
+        "assessment_source": "stateless_raw_metrics",
+        "raw_stateless_metrics": True,
+        "note": "Provisional level from finite supplied scores clamped to [0,1] (no evidence counts).",
     }
 
 

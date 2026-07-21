@@ -50,6 +50,6 @@ def test_assessment_reports_credible_interval_not_confidence():
     result = A.assess_user_level(stats, context, independent_recording_count=8, now=FIXED_NOW)
     assert "credible_interval" in result
     assert "confidence_interval" not in result
-    assert result["interval_method"] == "beta_posterior_monte_carlo"
+    assert result["interval_method"] == "quality_weighted_beta_posterior_monte_carlo"
     lo, hi = result["credible_interval"]
     assert 0.0 <= lo <= result["pronunciation_score"] <= hi <= 100.0
