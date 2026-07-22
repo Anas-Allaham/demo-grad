@@ -10,12 +10,13 @@ Kept dependency-free (stdlib `sqlite3` only) and importable outside Flask
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "app.db"
+DB_PATH = Path(os.environ.get("APP_DB_PATH", str(BASE_DIR / "app.db"))).expanduser()
 
 _connection: Optional[sqlite3.Connection] = None
 

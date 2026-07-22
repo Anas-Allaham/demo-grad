@@ -1,0 +1,14 @@
+# Production/runtime dependencies for the Modal CPU image.
+# Torch is installed separately from PyTorch's CPU-only package index in
+# modal_app.py so that the image does not download unused CUDA libraries.
+flask==3.1.3
+transformers==5.7.0
+librosa==0.11.0
+soundfile==0.13.1
+imageio-ffmpeg==0.6.0
+numpy==2.3.5
+scipy==1.18.0
+panphon==0.22.2
+python-dotenv
+cleanvoice-sdk==2.0.5
+openai==2.45.0
