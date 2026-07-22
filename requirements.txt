@@ -12,6 +12,7 @@ nemo_toolkit[tts]
 matplotlib
 scipy
 python-dotenv
+cleanvoice-sdk>=2.0.5,<3
 
 # Optional: only needed for the LLM-generation fallback in content.py
 # (used when the offline sentence bank has no good match for a user's

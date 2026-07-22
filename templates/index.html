@@ -73,9 +73,17 @@
                 <button id="stopReadBtn" class="secondary-button" type="button" disabled>Stop Reading</button>
             </div>
 
-            <audio id="audioPlayback" controls></audio>
+            <div class="playback-buttons" aria-label="Compare the recording before and after edits">
+                <button id="playBeforeBtn" class="secondary-button" type="button" disabled>Listen Before Edits</button>
+                <button id="playAfterBtn" class="secondary-button" type="button" disabled>Listen After Edits</button>
+            </div>
+
+            <div id="originalAudioSection" class="audio-preview-section">
+                <label for="audioPlayback">Before Edits (Original Recording)</label>
+                <audio id="audioPlayback" controls></audio>
+            </div>
             <div id="reducedAudioSection" class="hidden">
-                <label id="reducedAudioLabel" for="reducedAudioPlayback">Noise-Reduced Playback</label>
+                <label id="reducedAudioLabel" for="reducedAudioPlayback">After Edits (Cleanvoice)</label>
                 <audio id="reducedAudioPlayback" controls></audio>
             </div>
             <p id="statusText" class="status">Ready.</p>

@@ -1,5 +1,6 @@
 """Audit #10: end-to-end Flask route tests (acoustic/model layer mocked)."""
 
+import base64
 import io
 from pathlib import Path
 
@@ -93,6 +94,38 @@ def test_analyze_scorable_updates_trusted_mastery_and_deletes_audio(client, monk
     # #8: no audio artifact left behind.
     after = set(uploads.glob("*"))
     assert after == before
+
+
+def test_analyze_can_return_temporary_processed_audio_for_playback(client, monkeypatch):
+    cleaned_bytes = b"RIFF-cleanvoice-wav"
+
+    def processed_result(audio_path):
+        reduced_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
+        reduced_path.write_bytes(cleaned_bytes)
+        result = _scorable_result(audio_path)
+        result["reduced_audio_path"] = reduced_path
+        result["cleanup_paths"].append(reduced_path)
+        result["noise_reduction_applied"] = True
+        result["cleanvoice_applied"] = True
+        return result
+
+    monkeypatch.setattr(flask_app, "process_recording", processed_result)
+    uploads = flask_app.UPLOAD_FOLDER
+    before = set(uploads.glob("*"))
+    response = client.post(
+        "/analyze",
+        data={
+            "text": "school",
+            "include_processed_audio": "1",
+            "audio": (io.BytesIO(b"RIFFfake"), "rec.webm", "audio/webm"),
+        },
+        content_type="multipart/form-data",
+    ).get_json()
+
+    prefix, encoded = response["processed_audio_data_url"].split(",", 1)
+    assert prefix == "data:audio/wav;base64"
+    assert base64.b64decode(encoded) == cleaned_bytes
+    assert set(uploads.glob("*")) == before
 
 
 def test_analyze_unscorable_is_rejected_and_updates_no_mastery(client, monkeypatch):

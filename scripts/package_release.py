@@ -28,7 +28,8 @@ ALLOWED_ROOT_DIRS = {
 }
 ALLOWED_ROOT_FILES = {
     ".env.example", ".gitignore", "README.md", "TEST_OUTPUT.txt", "app.py",
-    "app_datetime.py", "assessment.py", "audio_quality.py", "content.py", "db.py",
+    "app_datetime.py", "assessment.py", "audio_quality.py", "cleanvoice_service.py",
+    "content.py", "db.py",
     "g2p_service.py", "mastery.py", "phoneme_vectors.py",
     "phoneme_vectors_professional.py", "pytest.ini", "requirements-minimal.txt",
     "requirements.txt", "scoring.py", "services.py", "test_g2p.py", "tokenization.py",

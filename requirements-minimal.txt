@@ -16,6 +16,7 @@ noisereduce
 panphon
 scipy
 python-dotenv
+cleanvoice-sdk>=2.0.5,<3
 
 # Test runner (unit tests do not require torch/panphon; the acoustic layer is
 # mocked/bypassed).

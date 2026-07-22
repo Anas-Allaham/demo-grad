@@ -55,6 +55,11 @@ This version hardens the evidence pipeline:
 
 ## Pipeline
 
+For scorable recordings, optional Cleanvoice preprocessing runs after the
+local audio-quality gate and before Wav2Vec2 transcription. It performs noise
+removal and normalization only; speech-cutting features remain disabled so
+pronunciation timing and content are preserved.
+
 ```text
 audio quality gate
    → canonical phoneme tokenization
@@ -225,6 +230,20 @@ python -m spacy download en_core_web_sm
    `GEMINI_API_KEY`. Without a key the app runs retrieval-only. **Never commit `.env`.**
 
 ---
+
+## Cleanvoice setup
+
+Add `CLEANVOICE_API_KEY` to the gitignored `.env` file. The Flask server sends
+scorable audio to Cleanvoice and downloads the enhanced WAV; the API key is
+never exposed to browser JavaScript. Cleanvoice processing is asynchronous, so
+a request may take roughly 30 seconds. Cleanvoice retains source and processed
+files for up to 7 days, so review its data-processing terms before enabling it
+for users.
+
+By default an API outage falls back to the existing local cleanup and reports
+that fallback in `preprocessing_pipeline` and `cleanvoice_error`. Set
+`CLEANVOICE_STRICT=1` if analysis must stop instead. `CLEANVOICE_STUDIO_SOUND`
+defaults to off because aggressive enhancement can alter acoustic evidence.
 
 ## Build the exercise bank
 

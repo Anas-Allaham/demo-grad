@@ -17,6 +17,7 @@ Wav2Vec2 acoustic step:
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import uuid
@@ -56,6 +57,14 @@ import mastery
 import services
 from app_datetime import format_db_datetime, parse_db_datetime
 from audio_quality import AudioQualityDecision, analyze_audio_quality, should_update_mastery
+from cleanvoice_service import (
+    CleanvoiceProcessingError,
+    cleanvoice_configured,
+    cleanvoice_enabled,
+    cleanvoice_sdk_available,
+    cleanvoice_strict,
+    enhance_recording,
+)
 from g2p_service import (
     G2P_DIR,
     HETERONYMS_PATH,
@@ -96,6 +105,7 @@ VOICE_FILTERING_DIR = BASE_DIR / "voice-filtering"
 # Set RETAIN_AUDIO=1 (env) only if you explicitly want to keep them (e.g. to
 # offer noise-reduced playback). Never enable this for shared/production use.
 RETAIN_AUDIO = os.environ.get("RETAIN_AUDIO", "0") == "1"
+MAX_INLINE_PLAYBACK_BYTES = 12 * 1024 * 1024
 
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 db.init_db()
@@ -260,18 +270,40 @@ def _cleanup_audio_files(paths: List[Optional[Path]]) -> None:
             print("Could not delete temporary audio:", repr(exc))
 
 
+def _audio_data_url(path: Optional[Path]) -> Optional[str]:
+    """Encode processed audio for playback before deleting its temporary file."""
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    if path.stat().st_size > MAX_INLINE_PLAYBACK_BYTES:
+        return None
+    mime_type = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _candidate_cleanup_paths(audio_path: Path) -> List[Path]:
     """Every filename the post-save recording path can create."""
     audio_path = Path(audio_path)
     return [
         audio_path,
         audio_path.with_name(audio_path.stem + "_converted.wav"),
+        audio_path.with_name(audio_path.stem + "_cleanvoice.wav"),
         audio_path.with_name(audio_path.stem + "_reduced.wav"),
     ]
 
 
 def process_recording(audio_path: Path) -> Dict[str, Any]:
-    """Convert -> quality-gate -> (if scorable) noise-reduce -> transcribe.
+    """Convert -> quality-gate -> enhance -> transcribe.
 
     If the audio-quality gate rejects the recording, transcription is skipped
     entirely and ``predicted_ipa`` is None -- the caller must not score it.
@@ -288,17 +320,43 @@ def process_recording(audio_path: Path) -> Dict[str, Any]:
         "reduced_audio_path": None,
         "noise_reduction_applied": False,
         "preprocessing_pipeline": "not_processed",
+        "cleanvoice_applied": False,
+        "cleanvoice_error": None,
         "cleanup_paths": [audio_path, wav_path],
     }
     if not decision.scorable:
         return result  # gate: do not transcribe or score an unscorable recording
 
-    reduced_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
-    model_input_path, applied, pipeline = _apply_noise_reduction(wav_path, reduced_path)
+    cleanvoice_path = audio_path.with_name(audio_path.stem + "_cleanvoice.wav")
+    result["cleanup_paths"].append(cleanvoice_path)
+    model_input_path: Path
+    applied = False
+    pipeline = "raw_audio_fallback"
+
+    if cleanvoice_configured():
+        try:
+            print("Enhancing with CleanVoice...")
+            model_input_path = enhance_recording(wav_path, cleanvoice_path)
+            applied = True
+            pipeline = "cleanvoice_noise_reduction_normalization"
+            result["cleanvoice_applied"] = True
+        except CleanvoiceProcessingError as exc:
+            print("Cleanvoice preprocessing failed:", str(exc))
+            result["cleanvoice_error"] = str(exc)
+            if cleanvoice_strict():
+                raise
+            reduced_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
+            model_input_path, applied, local_pipeline = _apply_noise_reduction(wav_path, reduced_path)
+            pipeline = f"cleanvoice_failed_fallback:{local_pipeline}"
+            result["cleanup_paths"].append(reduced_path)
+    else:
+        reduced_path = audio_path.with_name(audio_path.stem + "_reduced.wav")
+        model_input_path, applied, pipeline = _apply_noise_reduction(wav_path, reduced_path)
+        result["cleanup_paths"].append(reduced_path)
+
     result["noise_reduction_applied"] = applied
     result["preprocessing_pipeline"] = pipeline
-    result["reduced_audio_path"] = reduced_path if reduced_path.exists() else None
-    result["cleanup_paths"].append(reduced_path)
+    result["reduced_audio_path"] = model_input_path if model_input_path.exists() else None
 
     load_wav2vec_model()
     model_audio, _ = librosa.load(str(model_input_path), sr=16000, mono=True)
@@ -505,6 +563,10 @@ def health():
         "canonical_inventory_unsupported": inventory_report["unsupported"],
         "audio_filter_safe_available": safe_process_audio_file is not None,
         "audio_retention_enabled": RETAIN_AUDIO,
+        "cleanvoice_enabled": cleanvoice_enabled(),
+        "cleanvoice_configured": cleanvoice_configured(),
+        "cleanvoice_sdk_available": cleanvoice_sdk_available(),
+        "cleanvoice_strict": cleanvoice_strict(),
     })
 
 
@@ -600,6 +662,11 @@ def analyze():
 
         predicted_ipa = recording["predicted_ipa"]
         reduced_audio_path = recording["reduced_audio_path"]
+        processed_audio_data_url = (
+            _audio_data_url(reduced_audio_path)
+            if request.form.get("include_processed_audio") == "1"
+            else None
+        )
         # Reduced-audio playback is only offered when retention is enabled;
         # otherwise the file is deleted below and there is nothing to serve.
         reduced_audio_url = (
@@ -657,8 +724,11 @@ def analyze():
             "mastery_note": mastery_note,
             "noise_reduction_applied": recording["noise_reduction_applied"],
             "preprocessing_pipeline": recording["preprocessing_pipeline"],
+            "cleanvoice_applied": recording.get("cleanvoice_applied", False),
+            "cleanvoice_error": recording.get("cleanvoice_error"),
             "audio_quality": decision.to_dict(),
             "reduced_audio_url": reduced_audio_url,
+            "processed_audio_data_url": processed_audio_data_url,
             "alignment": api_alignment,
             "metrics": metrics,
             "profile": profile,
@@ -666,6 +736,8 @@ def analyze():
 
     except AudioDecodeError as e:
         return jsonify({"error": str(e), "code": "audio_decode_unavailable"}), 400
+    except CleanvoiceProcessingError as e:
+        return jsonify({"error": str(e), "code": "cleanvoice_unavailable"}), 502
     except Exception as e:
         import traceback
         print("\n========== REAL ERROR ==========")

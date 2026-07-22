@@ -29,7 +29,7 @@ def test_packager_exclusion_policy_covers_private_artifacts():
         assert package._excluded(package.BASE_DIR / relative), relative
 
     included = [
-        ".env.example", "app.py", "data/seed_sentences.txt",
+        ".env.example", "app.py", "cleanvoice_service.py", "data/seed_sentences.txt",
         "tests/fixtures/speech_sample.wav", "uploads/.gitkeep",
     ]
     for relative in included:
@@ -47,6 +47,7 @@ def test_packager_builds_and_validates_clean_archive(tmp_path, monkeypatch):
 
     assert "MANIFEST.txt" in names
     assert "app.py" in names
+    assert "cleanvoice_service.py" in names
     assert "tests/test_packaging.py" in names
     assert len(names) == hashed_count + 1
     assert ".env" not in names

@@ -30,6 +30,7 @@ uploads/*
 *.opus
 # Temporary audio the pipeline writes next to an upload.
 *_converted.wav
+*_cleanvoice.wav
 *_reduced.wav
 # Committed test fixtures are the ONLY audio that is tracked.
 !tests/fixtures/

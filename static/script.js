@@ -1,6 +1,7 @@
 let mediaRecorder;
 let audioChunks = [];
 let recordedBlob = null;
+let originalAudioUrl = null;
 
 let activeProfile = localStorage.getItem("pronunciation_profile") || "";
 let currentSentenceId = null;
@@ -12,6 +13,8 @@ const audioPlayback = document.getElementById("audioPlayback");
 const reducedAudioPlayback = document.getElementById("reducedAudioPlayback");
 const reducedAudioSection = document.getElementById("reducedAudioSection");
 const reducedAudioLabel = document.getElementById("reducedAudioLabel");
+const playBeforeBtn = document.getElementById("playBeforeBtn");
+const playAfterBtn = document.getElementById("playAfterBtn");
 const statusText = document.getElementById("statusText");
 const toggleGuideBtn = document.getElementById("toggleGuideBtn");
 const readTextBtn = document.getElementById("readTextBtn");
@@ -20,6 +23,21 @@ const stopReadBtn = document.getElementById("stopReadBtn");
 const hasSpeechSynthesis = "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
 let availableVoices = [];
 let activeUtterance = null;
+
+configurePlaybackButton(
+    playBeforeBtn,
+    audioPlayback,
+    "Listen Before Edits",
+    "Pause Before Edits",
+    reducedAudioPlayback,
+);
+configurePlaybackButton(
+    playAfterBtn,
+    reducedAudioPlayback,
+    "Listen After Edits",
+    "Pause After Edits",
+    audioPlayback,
+);
 
 if (hasSpeechSynthesis) {
     loadVoices();
@@ -98,6 +116,14 @@ startBtn.onclick = async () => {
         stopTextReader(true);
         audioChunks = [];
         recordedBlob = null;
+        if (originalAudioUrl) {
+            URL.revokeObjectURL(originalAudioUrl);
+            originalAudioUrl = null;
+        }
+        audioPlayback.removeAttribute("src");
+        audioPlayback.load();
+        playBeforeBtn.disabled = true;
+        playAfterBtn.disabled = true;
         if (reducedAudioPlayback && reducedAudioSection) {
             reducedAudioPlayback.removeAttribute("src");
             reducedAudioPlayback.load();
@@ -140,10 +166,11 @@ startBtn.onclick = async () => {
         mediaRecorder.onstop = () => {
             const blobType = mediaRecorder.mimeType || "audio/webm";
             recordedBlob = new Blob(audioChunks, { type: blobType });
-            const audioUrl = URL.createObjectURL(recordedBlob);
-            audioPlayback.src = audioUrl;
+            originalAudioUrl = URL.createObjectURL(recordedBlob);
+            audioPlayback.src = originalAudioUrl;
+            playBeforeBtn.disabled = false;
             analyzeBtn.disabled = false;
-            statusText.textContent = "Recording saved. You can analyze now.";
+            statusText.textContent = "Recording saved. Listen before edits, then analyze it.";
 
             stream.getTracks().forEach(track => track.stop());
         };
@@ -186,6 +213,7 @@ analyzeBtn.onclick = async () => {
     const formData = new FormData();
     formData.append("text", text);
     formData.append("audio", recordedBlob, "raw_browser_recording.webm");
+    formData.append("include_processed_audio", "1");
     if (activeProfile) {
         formData.append("user", activeProfile);
     }
@@ -195,7 +223,7 @@ analyzeBtn.onclick = async () => {
 
     document.getElementById("loading").classList.remove("hidden");
     document.getElementById("results").classList.add("hidden");
-    statusText.textContent = "Sending audio to local backend...";
+    statusText.textContent = "Cleaning and analyzing audio... This can take about 30 seconds.";
 
     try {
         const response = await fetch("/analyze", {
@@ -229,9 +257,13 @@ analyzeBtn.onclick = async () => {
         if (data.scoring_trusted === false && data.mastery_note) {
             statusMessage = data.mastery_note;
         }
-        if (data.reduced_audio_url && data.noise_reduction_applied) {
+        if (data.cleanvoice_applied) {
+            statusMessage = "Analysis complete. Cleanvoice enhanced the recording before scoring.";
+        } else if (data.cleanvoice_error) {
+            statusMessage = "Analysis complete. Cleanvoice was unavailable, so local audio cleanup was used.";
+        } else if ((data.processed_audio_data_url || data.reduced_audio_url) && data.noise_reduction_applied) {
             statusMessage = "Analysis complete. You can now play the noise-reduced audio.";
-        } else if (data.reduced_audio_url) {
+        } else if (data.processed_audio_data_url || data.reduced_audio_url) {
             statusMessage = "Analysis complete. You can now play the processed audio.";
         } else if (!data.noise_reduction_applied) {
             statusMessage = "Analysis complete. Noise reduction package is not installed, so denoised playback is unavailable.";
@@ -263,15 +295,20 @@ analyzeBtn.onclick = async () => {
 function showResults(data) {
     document.getElementById("results").classList.remove("hidden");
     if (reducedAudioPlayback && reducedAudioSection) {
-        if (data.reduced_audio_url) {
-            reducedAudioPlayback.src = data.reduced_audio_url;
+        const processedAudioSource = data.processed_audio_data_url || data.reduced_audio_url;
+        if (processedAudioSource) {
+            reducedAudioPlayback.src = processedAudioSource;
+            playAfterBtn.disabled = false;
             if (reducedAudioLabel) {
-                reducedAudioLabel.textContent = data.noise_reduction_applied ? "Noise-Reduced Playback" : "Processed Playback";
+                reducedAudioLabel.textContent = data.cleanvoice_applied
+                    ? "Cleanvoice-Enhanced Playback"
+                    : (data.noise_reduction_applied ? "Noise-Reduced Playback" : "Processed Playback");
             }
             reducedAudioSection.classList.remove("hidden");
         } else {
             reducedAudioPlayback.removeAttribute("src");
             reducedAudioPlayback.load();
+            playAfterBtn.disabled = true;
             reducedAudioSection.classList.add("hidden");
         }
     }
@@ -308,6 +345,39 @@ function showResults(data) {
         table.appendChild(tr);
     });
 
+}
+
+function configurePlaybackButton(button, player, playLabel, pauseLabel, otherPlayer) {
+    if (!button || !player) {
+        return;
+    }
+
+    button.onclick = async () => {
+        if (!player.hasAttribute("src")) {
+            return;
+        }
+        if (player.paused) {
+            if (otherPlayer) {
+                otherPlayer.pause();
+            }
+            try {
+                await player.play();
+            } catch (error) {
+                statusText.textContent = "Audio playback failed: " + error.message;
+            }
+        } else {
+            player.pause();
+        }
+    };
+
+    player.addEventListener("play", () => {
+        button.textContent = pauseLabel;
+    });
+    const showPlayLabel = () => {
+        button.textContent = playLabel;
+    };
+    player.addEventListener("pause", showPlayLabel);
+    player.addEventListener("ended", showPlayLabel);
 }
 
 function escapeHtml(value) {

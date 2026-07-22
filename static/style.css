@@ -120,6 +120,18 @@ audio {
     margin-top: 10px;
 }
 
+.playback-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 18px 0 12px;
+}
+
+.playback-buttons button {
+    flex: 1 1 210px;
+}
+
+.audio-preview-section,
 #reducedAudioSection {
     margin-top: 14px;
 }
