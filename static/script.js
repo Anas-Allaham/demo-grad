@@ -240,23 +240,8 @@ analyzeBtn.onclick = async () => {
             return;
         }
 
-        // Audio-quality gate: an unscorable recording is not scored and does
-        // not update mastery. Ask the user to record again.
-        if (data.scorable === false) {
-            document.getElementById("results").classList.add("hidden");
-            const reasons = (data.audio_quality && data.audio_quality.reasons || []).join(", ");
-            statusText.textContent =
-                (data.message || "That recording could not be scored. Please record again.") +
-                (reasons ? " (" + reasons + ")" : "");
-            currentSentenceId = null;
-            return;
-        }
-
         showResults(data);
         let statusMessage = "Analysis complete.";
-        if (data.scoring_trusted === false && data.mastery_note) {
-            statusMessage = data.mastery_note;
-        }
         if (data.cleanvoice_applied) {
             statusMessage = "Analysis complete. Cleanvoice enhanced the recording before scoring.";
         } else if (data.cleanvoice_error) {
@@ -270,14 +255,19 @@ analyzeBtn.onclick = async () => {
         }
 
         const quality = data.audio_quality;
-        if (quality && quality.metrics && quality.quality_weight !== undefined && quality.quality_weight < 0.75) {
+        if (data.quality_warning) {
+            const reasons = (quality && quality.reasons || []).join(", ");
+            statusMessage += " Audio quality warning" +
+                (reasons ? " (" + reasons + ")" : "") +
+                ": the recording was still processed.";
+        } else if (quality && quality.metrics && quality.quality_weight !== undefined && quality.quality_weight < 0.75) {
             statusMessage += " Note: audio quality was borderline.";
         }
 
         if (data.profile && data.mastery_updated) {
             statusMessage += ` Counted toward ${data.profile.name}'s progress.`;
-        } else if (data.profile && data.scoring_trusted === false) {
-            statusMessage += " (Provisional score shown; progress not updated.)";
+        } else if (data.mastery_note) {
+            statusMessage += " " + data.mastery_note;
         }
 
         statusText.textContent = statusMessage;

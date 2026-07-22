@@ -74,7 +74,7 @@ def test_sdk_errors_are_not_exposed(tmp_path, monkeypatch):
     assert "signed-url" not in str(caught.value)
 
 
-def test_process_recording_uses_cleanvoice_output_before_model(tmp_path, monkeypatch):
+def test_process_recording_uses_cleanvoice_despite_quality_warning(tmp_path, monkeypatch):
     source = tmp_path / "recording.wav"
     source.write_bytes(b"raw wav")
     loaded_paths = []
@@ -103,7 +103,7 @@ def test_process_recording_uses_cleanvoice_output_before_model(tmp_path, monkeyp
     monkeypatch.setattr(
         flask_app,
         "analyze_audio_quality",
-        lambda *_args: AudioQualityDecision(True, 1.0, [], {}),
+        lambda *_args: AudioQualityDecision(False, 0.0, ["no_speech_modulation"], {}),
     )
     monkeypatch.setattr(flask_app, "cleanvoice_configured", lambda: True)
     monkeypatch.setattr(flask_app, "enhance_recording", fake_enhance)
@@ -120,6 +120,8 @@ def test_process_recording_uses_cleanvoice_output_before_model(tmp_path, monkeyp
 
     cleanvoice_path = source.with_name(source.stem + "_cleanvoice.wav")
     assert result["cleanvoice_applied"] is True
+    assert result["quality_decision"].scorable is False
+    assert result["predicted_ipa"] == "s"
     assert result["preprocessing_pipeline"] == "cleanvoice_noise_reduction_normalization"
     assert result["reduced_audio_path"] == cleanvoice_path
     assert loaded_paths == [source, cleanvoice_path]

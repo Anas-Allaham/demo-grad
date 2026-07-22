@@ -18,8 +18,8 @@ adaptive, confusion-aware per-phoneme practice loop.
 
 This version hardens the evidence pipeline:
 
-1. **Speech-presence audio gate** — energy is no longer enough. Steady or
-   amplitude-modulated noise/tones, a DC offset, silence, and clipping are rejected using spectral
+1. **Speech-presence quality diagnostics** — energy is no longer enough. Steady or
+   amplitude-modulated noise/tones, a DC offset, silence, and clipping are flagged using spectral
    flatness, spectral bandwidth, zero-crossing rate, and syllable-rate envelope
    modulation. Validated against a real speech fixture (`tests/fixtures/`).
 2. **Scoring provenance & trust** — every attempt stores `scoring_engine`,
@@ -55,13 +55,13 @@ This version hardens the evidence pipeline:
 
 ## Pipeline
 
-For scorable recordings, optional Cleanvoice preprocessing runs after the
-local audio-quality gate and before Wav2Vec2 transcription. It performs noise
+For every decodable recording, optional Cleanvoice preprocessing runs after
+local audio-quality diagnostics and before Wav2Vec2 transcription. It performs noise
 removal and normalization only; speech-cutting features remain disabled so
 pronunciation timing and content are preserved.
 
 ```text
-audio quality gate
+audio quality diagnostics (non-blocking)
    → canonical phoneme tokenization
    → phoneme alignment (Needleman–Wunsch)
    → per-occurrence soft scores
@@ -70,8 +70,9 @@ audio quality gate
    → adaptive / confusion-aware exercises
 ```
 
-An **unscorable** recording (silence, clipping, too short, internal dropout,
-…) is rejected before any scoring and never updates mastery.
+A recording with quality warnings (silence, clipping, too short, internal
+dropout, …) is still enhanced, transcribed, and scored. It does not update
+long-term mastery, so uncertain audio cannot distort the learner's progress.
 
 If **PanPhon is not installed**, the app falls back to a small, clearly
 labelled articulatory-class distance so it keeps running, but it reports
@@ -90,7 +91,7 @@ mastery** from those numbers.
 | `g2p_service.py` | Text → IPA plus reference trust metadata; heteronyms resolve before NeMo/dictionary fallback. No torch. |
 | `scoring.py` | DP alignment + metrics. Keeps `articulatory_distance`, `alignment_cost`, and score strictly separate. |
 | `mastery.py` | Soft, **per-recording** Beta posterior with correct half-life decay. |
-| `audio_quality.py` | The scorability gate (`AudioQualityDecision`) + `should_update_mastery`. |
+| `audio_quality.py` | Non-blocking quality diagnostics (`AudioQualityDecision`) + the mastery-evidence gate. |
 | `assessment.py` | Evidence-aware level, confusion aggregation, exercise-type-by-mastery, diagnostic coverage. |
 | `services.py` | Ties assessment → exercise selection; shared by `/exercise` and `/practice/next`. |
 | `content.py` | Retrieval scoring + LLM generation-with-verification. |
@@ -186,7 +187,7 @@ checks), so stale skills decay in real time.
 ### Evidence-aware level (provisional; **not** CEFR)
 A phoneme is *level-eligible* only after **≥ 3 independent, trusted recordings**,
 **≥ 2.0 quality-weighted effective recordings**, and **≥ 2 distinct prompts**.
-Only scorable recordings with trusted PanPhon scoring and a trusted reference
+Only quality-approved recordings with trusted PanPhon scoring and a trusted reference
 G2P count. Insertions form a separate utterance-level posterior:
 ```
 epenthesis_obs       = max(0, 1 − insertion_count / reference_unit_count)
@@ -234,7 +235,7 @@ python -m spacy download en_core_web_sm
 ## Cleanvoice setup
 
 Add `CLEANVOICE_API_KEY` to the gitignored `.env` file. The Flask server sends
-scorable audio to Cleanvoice and downloads the enhanced WAV; the API key is
+every decodable recording to Cleanvoice and downloads the enhanced WAV; the API key is
 never exposed to browser JavaScript. Cleanvoice processing is asynchronous, so
 a request may take roughly 30 seconds. Cleanvoice retains source and processed
 files for up to 7 days, so review its data-processing terms before enabling it

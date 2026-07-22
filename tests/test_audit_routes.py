@@ -40,13 +40,13 @@ def _scorable_result(audio_path):
     }
 
 
-def _unscorable_result(audio_path):
+def _quality_warning_result(audio_path):
     return {
         "quality_decision": AudioQualityDecision(False, 0.0, ["no_speech_modulation"], {}),
-        "predicted_ipa": None,
+        "predicted_ipa": "s k u l",
         "reduced_audio_path": None,
         "noise_reduction_applied": False,
-        "preprocessing_pipeline": "not_processed",
+        "preprocessing_pipeline": "test_quality_override",
         "cleanup_paths": [audio_path],
     }
 
@@ -128,18 +128,21 @@ def test_analyze_can_return_temporary_processed_audio_for_playback(client, monke
     assert set(uploads.glob("*")) == before
 
 
-def test_analyze_unscorable_is_rejected_and_updates_no_mastery(client, monkeypatch):
-    monkeypatch.setattr(flask_app, "process_recording", _unscorable_result)
+def test_analyze_quality_warning_is_scored_but_updates_no_mastery(client, monkeypatch):
+    monkeypatch.setattr(flask_app, "process_recording", _quality_warning_result)
     data = {
         "text": "school",
         "user": "__routes_reject__",
         "audio": (io.BytesIO(b"RIFFfake"), "rec.webm", "audio/webm"),
     }
     resp = client.post("/analyze", data=data, content_type="multipart/form-data").get_json()
-    assert resp["scorable"] is False
-    assert "record again" in resp["message"].lower()
+    assert resp["scorable"] is True
+    assert resp["quality_warning"] is True
+    assert resp["predicted_ipa"] == "s k u l"
+    assert "utterance_score" in resp["metrics"]
+    assert "still processed" in resp["mastery_note"].lower()
 
-    # The rejected attempt did not create any mastery-updating evidence.
+    # It was accepted and aligned, but did not create mastery-updating evidence.
     import db
     user = db.get_user_by_name("__routes_reject__")
     assert db.get_trusted_recording_count(user["id"]) == 0
@@ -150,7 +153,7 @@ def test_analyze_unscorable_is_rejected_and_updates_no_mastery(client, monkeypat
         "JOIN attempts a ON a.id=e.attempt_id WHERE a.user_id=?",
         (user["id"],),
     ).fetchone()["n"]
-    assert event_count == 0
+    assert event_count > 0
 
 
 def test_analyze_response_carries_provenance(client, monkeypatch):

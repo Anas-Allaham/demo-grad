@@ -1,4 +1,4 @@
-"""Tests 13 & 18: audio-quality gate and PanPhon-unavailable safety."""
+"""Tests 13 & 18: audio-quality evidence and PanPhon-unavailable safety."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,18 +22,17 @@ def _load_speech_fixture():
     return np.asarray(audio, dtype=np.float64), int(sr)
 
 
-# 13. Non-scorable audio does not update mastery.
-def test_non_scorable_audio_blocks_mastery_update():
+# 13. A quality warning does not update mastery.
+def test_low_quality_audio_blocks_mastery_update_only():
     silent = np.zeros(SR, dtype=np.float32)
     decision = analyze_audio_quality(silent, SR)
     assert decision.scorable is False
 
-    # The gate: an unscorable recording never updates mastery, even if the
-    # engine is trusted.
+    # The app may still display a score, but uncertain audio never updates
+    # mastery even if the scoring engine is trusted.
     assert should_update_mastery(decision.scorable, scoring_trusted=True) is False
 
-    # And structurally: the app produces NO alignment for an unscorable
-    # recording, so even an update call would be a no-op.
+    # An empty alignment remains a no-op independently of the HTTP behavior.
     before = {"θ": mastery.PhonemeStat(alpha=3.0, beta=1.0, independent_attempts=2)}
     after = mastery.update_mastery_for_recording(before, [], now=FIXED_NOW)
     assert after["θ"].independent_attempts == 2

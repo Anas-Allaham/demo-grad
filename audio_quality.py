@@ -1,5 +1,5 @@
 """
-Audio-quality scoring gate.
+Audio-quality diagnostics and mastery-evidence gate.
 
 Turns a recording into an ``AudioQualityDecision``:
 
@@ -10,10 +10,9 @@ Turns a recording into an ``AudioQualityDecision``:
         "metrics": {...},
     }
 
-If ``scorable`` is False the caller (app.py) must NOT update phoneme mastery
-and must NOT complete the adaptive assignment -- it asks the user to record
-again instead. This is the gate the old code was missing: it reported audio
-problems but folded the recording into mastery anyway.
+If ``scorable`` is False, the caller may still enhance, transcribe, align, and
+show a score. It must not use that uncertain score to update phoneme mastery.
+This keeps recording acceptance separate from evidence quality.
 
 Design choices that matter linguistically:
   * Leading/trailing silence never invalidates a recording (people breathe

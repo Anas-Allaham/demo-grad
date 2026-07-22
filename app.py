@@ -149,7 +149,7 @@ def load_wav2vec_model() -> None:
 
 
 # -----------------------------
-# Audio conversion + quality gate + transcription
+# Audio conversion + quality diagnostics + transcription
 # -----------------------------
 def _find_ffmpeg_executable() -> Optional[str]:
     """Locate FFmpeg from an explicit env var, PATH, or imageio-ffmpeg."""
@@ -303,10 +303,11 @@ def _candidate_cleanup_paths(audio_path: Path) -> List[Path]:
 
 
 def process_recording(audio_path: Path) -> Dict[str, Any]:
-    """Convert -> quality-gate -> enhance -> transcribe.
+    """Convert -> inspect quality -> enhance -> transcribe.
 
-    If the audio-quality gate rejects the recording, transcription is skipped
-    entirely and ``predicted_ipa`` is None -- the caller must not score it.
+    Every decodable recording continues through enhancement and transcription.
+    The quality decision is advisory for UI warnings and mastery protection; it
+    never blocks the user from seeing a score.
     ``cleanup_paths`` lists every on-disk artifact this produced so the caller
     can delete them after processing (private/temporary by default).
     """
@@ -324,9 +325,6 @@ def process_recording(audio_path: Path) -> Dict[str, Any]:
         "cleanvoice_error": None,
         "cleanup_paths": [audio_path, wav_path],
     }
-    if not decision.scorable:
-        return result  # gate: do not transcribe or score an unscorable recording
-
     cleanvoice_path = audio_path.with_name(audio_path.stem + "_cleanvoice.wav")
     result["cleanup_paths"].append(cleanvoice_path)
     model_input_path: Path
@@ -409,18 +407,20 @@ def _record_recording(
     g2p_mode: str,
     reference_g2p_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Persist one scorable recording as a SINGLE atomic transaction (attempt +
-    events + mastery + assignment completion). Mastery is updated ONLY when the
-    scoring engine is trusted; audio quality is applied as fractional Beta
-    evidence, never as a pronunciation failure. Returns
+    """Persist one processed recording as a SINGLE atomic transaction (attempt +
+    events + mastery + assignment completion). Every decoded recording may be
+    displayed and saved, but mastery is updated only when its quality, scoring
+    engine, and reference pronunciation are trusted. Returns
     {attempt_id, mastery_updated}."""
     mastery_updated = should_update_mastery(
-        scorable=True,
+        scorable=quality_decision.scorable,
         scoring_trusted=engine_trusted and reference_g2p_trusted,
     )
 
     phoneme_states: Optional[Dict[str, Dict[str, Any]]] = None
-    complete_exercise_id: Optional[int] = None
+    # The user completed the recording even if its quality is too weak for
+    # long-term mastery evidence; do not force the same assignment again.
+    complete_exercise_id: Optional[int] = exercise_id
     if mastery_updated:
         now = datetime.now(timezone.utc)
         stats = services.load_profile_stats(user_id)
@@ -433,7 +433,6 @@ def _record_recording(
             for r in alignment if r.get("expected") not in (None, "-")
         }
         phoneme_states = {ph: _stat_to_row(updated[ph]) for ph in touched if ph in updated}
-        complete_exercise_id = exercise_id
 
     attempt_kwargs = {
         "text": user_text,
@@ -444,7 +443,7 @@ def _record_recording(
         "exercise_id": exercise_id,
         "raw_weighted_per": metrics["raw_weighted_per"],
         "quality_weight": quality_decision.quality_weight,
-        "scorable": True,
+        "scorable": quality_decision.scorable,
         "scoring_engine": engine_name,
         "scoring_trusted": engine_trusted,
         "mastery_updated": mastery_updated,
@@ -634,32 +633,6 @@ def analyze():
         reference_reason = ",".join(reference_reason_parts) or None
         user_row = db.get_or_create_user(profile_name) if profile_name else None
 
-        # ---- Audio-quality gate: reject unscorable recordings ----
-        if not decision.scorable:
-            if user_row is not None:
-                # Audit row only: rejected audio creates no alignment events or
-                # mastery evidence.
-                db.record_attempt(
-                    user_id=user_row["id"], text=user_text, reference_ipa=reference_ipa,
-                    predicted_ipa="", phoneme_error_rate=0.0, weighted_error=0.0,
-                    quality_weight=decision.quality_weight, scorable=False,
-                    rejected_reason=",".join(decision.reasons),
-                    scoring_engine=engine_name, scoring_trusted=False, mastery_updated=False,
-                    g2p_mode=reference.g2p_mode,
-                    reference_g2p_trusted=reference.reference_g2p_trusted,
-                    reference_g2p_reason=reference_reason,
-                )
-            return jsonify({
-                "scorable": False,
-                "audio_quality": decision.to_dict(),
-                "message": "That recording could not be scored. Please record again "
-                           "(check your mic, avoid clipping, and speak the full sentence).",
-                "reference_ipa": reference_ipa,
-                "reference_guide": ipa_reading_guide(reference_ipa),
-                **reference.to_dict(),
-                "profile": ({"id": user_row["id"], "name": user_row["name"]} if user_row else None),
-            })
-
         predicted_ipa = recording["predicted_ipa"]
         reduced_audio_path = recording["reduced_audio_path"]
         processed_audio_data_url = (
@@ -707,11 +680,17 @@ def analyze():
             mastery_note = (
                 "The reference pronunciation is unresolved or unsupported; mastery was NOT updated."
             )
+        elif not decision.scorable:
+            mastery_note = (
+                "Audio quality warnings were detected, but the recording was still processed. "
+                "The score is shown without updating progress."
+            )
         else:
             mastery_note = None
 
         return jsonify({
             "scorable": True,
+            "quality_warning": not decision.scorable,
             "text": user_text,
             "reference_ipa": reference_ipa,
             "predicted_ipa": predicted_ipa,
