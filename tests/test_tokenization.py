@@ -29,6 +29,10 @@ def test_both_formats_agree():
     assert ipa_to_tokens("skuːl ɪz oʊpən") == ref
 
 
+def test_ctc_control_tokens_are_removed_before_phoneme_tokenization():
+    assert tokenize_ctc_prediction("s[UNK]kuːl [PAD]") == ["s", "k", "u", "l"]
+
+
 # 3. Canonical long-vowel mapping: model has no /ː/, so long vowels collapse.
 def test_canonical_long_vowel_mapping():
     assert canonicalize_phoneme("iː") == "i"

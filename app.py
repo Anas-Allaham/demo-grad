@@ -51,6 +51,7 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 import assessment as assessment_mod
+from arpabet import metrics_to_internal_ipa, to_public_arpabet
 import content
 import db
 import mastery
@@ -94,6 +95,12 @@ from tokenization import (
 )
 
 app = Flask(__name__)
+
+
+def jsonify_arpabet(payload: Any):
+    """Serialize an internal IPA payload for the ARPAbet browser contract."""
+    return jsonify(to_public_arpabet(payload))
+
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
@@ -537,9 +544,11 @@ def health():
         and bank_count > 0
     )
 
-    return jsonify({
+    return jsonify_arpabet({
         "status": "running",
         "ready": ready,
+        "alphabet": "arpabet",
+        "internal_alphabet": "ipa",
         "device": device,
         "model_config_present": model_config_present,
         "model_weight_present": weight_present,
@@ -582,7 +591,7 @@ def g2p_route():
         if not text:
             return jsonify({"error": "Please send text."}), 400
         resolution = g2p_convert_with_metadata(text)
-        return jsonify({
+        return jsonify_arpabet({
             "text": text,
             "ipa": resolution.ipa,
             "guide": ipa_reading_guide(resolution.ipa),
@@ -688,7 +697,7 @@ def analyze():
         else:
             mastery_note = None
 
-        return jsonify({
+        return jsonify_arpabet({
             "scorable": True,
             "quality_warning": not decision.scorable,
             "text": user_text,
@@ -823,7 +832,7 @@ def practice_next():
 
         db.record_practice_assignment(user_id, chosen["id"], targets)
 
-        return jsonify({
+        return jsonify_arpabet({
             "sentence_id": chosen["id"],
             "text": chosen["text"],
             "reference_ipa": chosen["reference_ipa"],
@@ -857,7 +866,10 @@ def exercise_route():
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
             if "metrics" in data:
-                metrics = {str(k): float(v) for k, v in (data.get("metrics") or {}).items()}
+                try:
+                    metrics = metrics_to_internal_ipa(data.get("metrics"))
+                except (TypeError, ValueError) as exc:
+                    return jsonify({"error": f"Invalid ARPAbet metrics: {exc}"}), 400
             else:
                 user_name = str(data.get("user", "")).strip()
         else:
@@ -881,13 +893,13 @@ def exercise_route():
 
         exercise = result.get("exercise")
         if exercise is None:
-            return jsonify(result), 503
+            return jsonify_arpabet(result), 503
 
         if user_name:
             db.record_practice_assignment(user_row["id"], exercise["sentence_id"], result["target_phonemes"])
 
         exercise["reference_guide"] = ipa_reading_guide(exercise["reference_ipa"])
-        return jsonify(result)
+        return jsonify_arpabet(result)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -903,7 +915,7 @@ def practice_assessment():
     user_row = db.get_user_by_name(profile_name)
     if user_row is None:
         return jsonify({"assessment": None})
-    return jsonify({"assessment": services.assess_profile(user_row["id"])})
+    return jsonify_arpabet({"assessment": services.assess_profile(user_row["id"])})
 
 
 @app.route("/practice/gaps")
@@ -932,7 +944,7 @@ def practice_gaps():
             "last_practiced_at": stat.last_practiced_at.isoformat() if stat.last_practiced_at else None,
             "example": guide.get("example", ""),
         })
-    return jsonify({"phonemes": phonemes})
+    return jsonify_arpabet({"phonemes": phonemes})
 
 
 @app.route("/practice/history")

@@ -1,7 +1,13 @@
 from pathlib import Path
+import sys
 import time
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from contextual_g2p import ContextAwareIpaG2p
+from phoneme_alphabet import IPAInputFormat, ipa_to_arpabet
 
 
 def main() -> None:
@@ -42,21 +48,26 @@ def main() -> None:
         # "We evaluated phoneme error rate using a grapheme-to-phoneme model."
         # "The spectrogram was computed using mel-frequency scaling."
         # "Fine-tuning improved performance on out-of-vocabulary words."
-        "aya is perfect "
+        "School is open."
     ]
 
     total_start = time.time()
 
     for text in examples:
         start = time.time()
-        phonemes = g2p(text)
+        ipa_words = g2p(text)
         elapsed = time.time() - start
 
-        ipa_sentence = " ".join(phonemes)
+        ipa_sentence = " | ".join(ipa_words)
+        arpabet_sentence = ipa_to_arpabet(
+            ipa_sentence,
+            input_format=IPAInputFormat.FORMATTED_REFERENCE,
+        )
 
         print("=" * 80)
         print("INPUT   :", text)
         print("IPA     :", ipa_sentence)
+        print("ARPABET :", arpabet_sentence)
         print(f"EXECUTION TIME: {elapsed:.6f} seconds")
 
     total_elapsed = time.time() - total_start

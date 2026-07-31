@@ -32,7 +32,7 @@ def client(temp_db, monkeypatch):
 def _scorable_result(audio_path):
     return {
         "quality_decision": AudioQualityDecision(True, 0.95, [], {"envelope_modulation": 0.5}),
-        "predicted_ipa": "s k u l",
+        "predicted_ipa": "skuːl",
         "reduced_audio_path": None,
         "noise_reduction_applied": False,
         "preprocessing_pipeline": "test",
@@ -43,7 +43,7 @@ def _scorable_result(audio_path):
 def _quality_warning_result(audio_path):
     return {
         "quality_decision": AudioQualityDecision(False, 0.0, ["no_speech_modulation"], {}),
-        "predicted_ipa": "s k u l",
+        "predicted_ipa": "skuːl",
         "reduced_audio_path": None,
         "noise_reduction_applied": False,
         "preprocessing_pipeline": "test_quality_override",
@@ -59,12 +59,15 @@ def test_health_reports_readiness_and_trust(client):
     assert h["audio_retention_enabled"] is False
     assert h["heteronym_resolution_active"] is True
     assert h["heteronym_entries_checked"] == 72
+    assert h["alphabet"] == "arpabet"
+    assert h["internal_alphabet"] == "ipa"
 
 
 def test_g2p_route(client):
     data = client.post("/g2p", json={"text": "school"}).get_json()
-    assert data["ipa"]
-    assert "s" in data["ipa"]
+    assert data["arpabet"]
+    assert "S" in data["arpabet"]
+    assert "ipa" not in data
     assert data["heteronym_resolution_active"] is True
     assert data["reference_g2p_trusted"] is True
 
@@ -73,6 +76,8 @@ def test_practice_next_cold_start_is_diagnostic(client):
     r = client.get("/practice/next?user=__routes_new__").get_json()
     assert r["mode"] == "diagnostic"
     assert r["diagnostic"]["in_diagnostic"] is True
+    assert r["reference_arpabet"]
+    assert "reference_ipa" not in r
 
 
 def test_analyze_scorable_updates_trusted_mastery_and_deletes_audio(client, monkeypatch):
@@ -90,7 +95,15 @@ def test_analyze_scorable_updates_trusted_mastery_and_deletes_audio(client, monk
     assert resp["scorable"] is True
     assert resp["scoring_trusted"] is True          # PanPhon is installed + validated
     assert resp["mastery_updated"] is True
+    assert resp["reference_arpabet"]
+    assert resp["predicted_arpabet"] == "S K UW L"
+    assert "reference_ipa" not in resp and "predicted_ipa" not in resp
+    assert all(row["expected"] == "-" or row["expected"].isascii() for row in resp["alignment"])
     assert "utterance_score" in resp["metrics"]
+    gaps = client.get("/practice/gaps?user=__routes_user__").get_json()["phonemes"]
+    assert gaps and all(item["phoneme"].isascii() for item in gaps)
+    assessment = client.get("/practice/assessment?user=__routes_user__").get_json()["assessment"]
+    assert all(phoneme.isascii() for phoneme in assessment["unknown_phonemes"])
     # #8: no audio artifact left behind.
     after = set(uploads.glob("*"))
     assert after == before
@@ -138,7 +151,7 @@ def test_analyze_quality_warning_is_scored_but_updates_no_mastery(client, monkey
     resp = client.post("/analyze", data=data, content_type="multipart/form-data").get_json()
     assert resp["scorable"] is True
     assert resp["quality_warning"] is True
-    assert resp["predicted_ipa"] == "s k u l"
+    assert resp["predicted_arpabet"] == "S K UW L"
     assert "utterance_score" in resp["metrics"]
     assert "still processed" in resp["mastery_note"].lower()
 
@@ -196,3 +209,18 @@ def test_untrusted_reference_never_updates_mastery(client, monkeypatch):
     import db
     user = db.get_user_by_name("__routes_permit__")
     assert db.get_all_phoneme_states(user["id"]) == []
+
+
+def test_exercise_accepts_arpabet_metrics_and_returns_arpabet(client):
+    response = client.post("/exercise", json={"metrics": {"TH": 0.1}})
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["assessment"]["weak_phonemes"][0]["phoneme"] == "TH"
+    assert data["exercise"]["reference_arpabet"]
+    assert "reference_ipa" not in data["exercise"]
+
+
+def test_exercise_rejects_unknown_arpabet_metrics(client):
+    response = client.post("/exercise", json={"metrics": {"BAD": 0.4}})
+    assert response.status_code == 400
+    assert "Unsupported IPA/ARPAbet phoneme" in response.get_json()["error"]

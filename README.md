@@ -4,6 +4,34 @@ Text → G2P → expected phonemes; audio → Wav2Vec2 → spoken phonemes; the 
 are aligned and scored into a **provisional** pronunciation score and an
 adaptive, confusion-aware per-phoneme practice loop.
 
+The phonetic engine remains IPA internally: the POS-aware heteronym resolver
+and NeMo produce reference IPA, Wav2Vec2 predicts IPA, and PanPhon, alignment,
+mastery, exercises, and SQLite all operate on IPA. Flask JSON responses and the
+browser UI expose only uppercase, stress-free **ARPAbet** (`S K UW L | IH Z`).
+The `/exercise` metrics input is also keyed by ARPAbet.
+
+The public ARPAbet boundary is validated: every emitted token belongs to the
+declared stress-free inventory, and unsupported reference/API tokens fail
+explicitly instead of leaking IPA into JSON. Formatted reference IPA uses `|`
+for word boundaries; raw CTC output treats whitespace as acoustic word
+boundaries. CTC-only component recovery is non-fatal and logged.
+
+The conversion is intentionally canonicalizing rather than lossless. A round
+trip back to IPA may normalize vowel length, allophones, and dialect variants
+to the application's American-English-oriented internal inventory.
+
+```text
+text  -> POS Tagger -> heteronym lexicon / NeMo -> reference IPA
+audio -> Wav2Vec2                              -> predicted IPA
+                         IPA alignment + PanPhon + persistence
+                                           |
+                                           v
+                              Flask IPA -> ARPAbet boundary
+                                           |
+                                           v
+                                      Browser UI
+```
+
 > ### ⚠️ Scientific honesty note
 > The scores here are **provisional**. They are built from PanPhon
 > articulatory *distance* — a description of how similar two phonemes are —
@@ -89,6 +117,7 @@ mastery** from those numbers.
 | `phoneme_vectors.py` | Thin compatibility wrapper re-exporting the professional module (no second implementation). |
 | `tokenization.py` | `normalize_ipa`, `split_ipa_word`, `tokenize_reference_ipa`, `tokenize_ctc_prediction`, `ipa_to_tokens`, reading guide. |
 | `g2p_service.py` | Text → IPA plus reference trust metadata; heteronyms resolve before NeMo/dictionary fallback. No torch. |
+| `phoneme_alphabet.py` / `arpabet.py` | IPA↔ARPAbet mapping and the recursive Flask/browser response boundary. |
 | `scoring.py` | DP alignment + metrics. Keeps `articulatory_distance`, `alignment_cost`, and score strictly separate. |
 | `mastery.py` | Soft, **per-recording** Beta posterior with correct half-life decay. |
 | `audio_quality.py` | Non-blocking quality diagnostics (`AudioQualityDecision`) + the mastery-evidence gate. |

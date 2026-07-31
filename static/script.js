@@ -303,8 +303,8 @@ function showResults(data) {
         }
     }
 
-    document.getElementById("referenceIpa").textContent = data.reference_ipa;
-    document.getElementById("predictedIpa").textContent = data.predicted_ipa;
+    document.getElementById("referenceArpabet").textContent = data.reference_arpabet;
+    document.getElementById("predictedArpabet").textContent = data.predicted_arpabet;
 
     document.getElementById("correctCount").textContent = data.metrics.correct;
     document.getElementById("subCount").textContent = data.metrics.substitutions;

@@ -30,12 +30,15 @@ MULTI_CHAR_PHONEMES: List[str] = list(COMPOSITE_COMPONENTS.keys())
 
 # Marks that attach to the preceding phoneme rather than forming their own.
 COMBINING_MARKS = {"ː", "̃", "̩", "̯", "ʰ", "˞"}
+CTC_CONTROL_TOKENS = ("[PAD]", "[UNK]", "<pad>", "<unk>", "<s>", "</s>")
 
 
 def normalize_ipa(text: str) -> str:
     """Canonicalize spacing and strip stress/bracket noise from an IPA string.
     Word boundaries are preserved as a spaced ``|`` token."""
     text = unicodedata.normalize("NFC", str(text))
+    for control_token in CTC_CONTROL_TOKENS:
+        text = text.replace(control_token, "")
     text = text.replace("ˈ", "").replace("ˌ", "")
     text = text.replace(":", "ː")
     text = text.replace("/", " ")

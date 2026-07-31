@@ -4,6 +4,7 @@ Imports g2p_service directly (not app.py), so it runs without torch/Wav2Vec2.
 """
 
 from g2p_service import g2p_convert, get_g2p_mode, load_g2p_engine
+from phoneme_alphabet import IPAInputFormat, ipa_to_arpabet
 
 load_g2p_engine()
 
@@ -16,7 +17,10 @@ examples = [
 
 for text in examples:
     print("TEXT:", text)
-    print("IPA :", g2p_convert(text))
+    print("ARPABET:", ipa_to_arpabet(
+        g2p_convert(text),
+        input_format=IPAInputFormat.FORMATTED_REFERENCE,
+    ))
     print()
 
 print("G2P mode:", get_g2p_mode())
