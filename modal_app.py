@@ -22,6 +22,30 @@ PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "model" / "my_wav2vec2_phoneme_model"
 MODEL_REMOTE_DIR = f"{APP_DIR}/model/my_wav2vec2_phoneme_model"
 
+# Predictive OOV G2P (ByT5). Weights are baked into a cached image layer at
+# build time so the running container never reaches the network. Keep this in
+# sync with oov_g2p.py DEFAULT_MODEL.
+HF_CACHE_DIR = "/opt/hf-cache"
+OOV_G2P_MODEL = "charsiu/g2p_multilingual_byT5_tiny_16_layers_100"
+
+
+def _bake_oov_g2p_model() -> None:
+    """Download the ByT5 OOV G2P weights into the image's HF cache at build time."""
+    import os as _os
+
+    _os.environ["HF_HOME"] = HF_CACHE_DIR
+    from transformers import AutoTokenizer, T5ForConditionalGeneration
+
+    T5ForConditionalGeneration.from_pretrained(OOV_G2P_MODEL)
+    # ByT5's byte tokenizer needs no vocab files; resolving it here just warms
+    # the config so the runtime (offline) load never touches the network.
+    try:
+        AutoTokenizer.from_pretrained(OOV_G2P_MODEL)
+    except Exception:
+        from transformers import ByT5Tokenizer
+
+        ByT5Tokenizer()
+
 # Never upload local secrets, recordings, databases, caches, or development
 # artifacts. The model is copied in its own cached layer below, so source-only
 # changes do not require uploading the 378 MB weight again.
@@ -61,8 +85,20 @@ runtime_image = (
             "CLEANVOICE_STRICT": "0",
             "RETAIN_AUDIO": "0",
             "PYTHONUNBUFFERED": "1",
+            # Predictive OOV G2P: enabled, with weights served from the baked
+            # HF cache below.
+            "OOV_G2P_ENABLED": "1",
+            "OOV_G2P_MODEL": OOV_G2P_MODEL,
+            "HF_HOME": HF_CACHE_DIR,
+            # The Xet transfer backend can stall on unauthenticated pulls; use
+            # the standard resolver for the deterministic build-time download.
+            "HF_HUB_DISABLE_XET": "1",
         }
     )
+    # Bake the ByT5 weights into their own cached layer (needs network at build
+    # time only), then pin the runtime offline so a request never fetches.
+    .run_function(_bake_oov_g2p_model)
+    .env({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
     .add_local_dir(
         str(MODEL_DIR),
         remote_path=MODEL_REMOTE_DIR,

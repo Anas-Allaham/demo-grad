@@ -37,6 +37,11 @@ class ReferenceG2PResult:
     unresolved_heteronyms: Tuple[str, ...] = ()
     unsupported_heteronyms: Tuple[str, ...] = ()
     oov_words: Tuple[str, ...] = ()
+    # Words with no reviewed lexicon entry that were served by the predictive
+    # ByT5 fallback. They carry a plausible pronunciation (so they are NOT
+    # left as raw-grapheme ``oov_words``) but are always UNTRUSTED, which is why
+    # any of them forces ``reference_g2p_trusted == False``.
+    predicted_words: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -46,6 +51,7 @@ class ReferenceG2PResult:
             "unresolved_heteronyms": list(self.unresolved_heteronyms),
             "unsupported_heteronyms": list(self.unsupported_heteronyms),
             "oov_words": list(self.oov_words),
+            "predicted_words": list(self.predicted_words),
         }
 
 
@@ -256,13 +262,39 @@ class DictionaryIpaG2p:
     mode = "context_aware_dictionary_fallback"
     heteronym_resolution_active = True
 
-    def __init__(self, resolver: Optional[ContextualHeteronymResolver] = None) -> None:
+    def __init__(
+        self,
+        resolver: Optional[ContextualHeteronymResolver] = None,
+        oov_predictor: Any = None,
+    ) -> None:
         self.dictionary = load_ipa_dictionary()
         self.resolver = resolver or ContextualHeteronymResolver()
+        # Optional predictive fallback (ByT5) for words with no reviewed lexicon
+        # entry. Its output is untrusted; see oov_g2p.py.
+        self.oov_predictor = oov_predictor
 
-    def _lookup_non_heteronym(self, word: str) -> Tuple[str, bool]:
-        ipa = self.dictionary.get(word)
-        return (ipa, True) if ipa is not None else (word, False)
+    def _lookup_dictionary(self, word: str) -> Optional[str]:
+        return self.dictionary.get(word)
+
+    def _predict_oov(self, word: str) -> Tuple[str, str]:
+        """Try the predictive fallback for a word with no trusted pronunciation.
+
+        Returns ``(ipa, "predicted")`` when the predictor yields a scorable
+        pronunciation, otherwise ``(word, "oov")``.
+        """
+        if self.oov_predictor is not None:
+            predicted = self.oov_predictor.predict(word)
+            if predicted:
+                return predicted, "predicted"
+        return word, "oov"
+
+    def _lookup_non_heteronym(self, word: str) -> Tuple[str, str]:
+        """Return ``(ipa, status)`` where status is one of ``trusted`` (reviewed
+        lexicon entry), ``predicted`` (untrusted ByT5 guess), or ``oov``."""
+        ipa = self._lookup_dictionary(word)
+        if ipa is not None:
+            return ipa, "trusted"
+        return self._predict_oov(word)
 
     def resolve(self, text: str) -> ReferenceG2PResult:
         words = [word.strip("'").lower() for word in re.findall(r"[A-Za-z']+", text)]
@@ -271,6 +303,7 @@ class DictionaryIpaG2p:
         unresolved: List[str] = []
         unsupported: List[str] = []
         oov: List[str] = []
+        predicted: List[str] = []
 
         for index, word in enumerate(words):
             decision = self.resolver.resolve(word, words, index, spacy_tags)
@@ -282,13 +315,21 @@ class DictionaryIpaG2p:
                     unresolved.append(word)
                 continue
 
-            ipa, trusted = self._lookup_non_heteronym(word)
+            ipa, status = self._lookup_non_heteronym(word)
             ipa_words.append(ipa)
-            if not trusted:
+            if status == "oov":
                 oov.append(word)
+            elif status == "predicted":
+                predicted.append(word)
 
         ipa = normalize_ipa(words_to_spaced_ipa(ipa_words))
-        trusted = bool(ipa) and not unresolved and not unsupported and not oov
+        trusted = (
+            bool(ipa)
+            and not unresolved
+            and not unsupported
+            and not oov
+            and not predicted
+        )
         return ReferenceG2PResult(
             text=text,
             ipa=ipa,
@@ -298,6 +339,7 @@ class DictionaryIpaG2p:
             unresolved_heteronyms=tuple(sorted(set(unresolved))),
             unsupported_heteronyms=tuple(sorted(set(unsupported))),
             oov_words=tuple(sorted(set(oov))),
+            predicted_words=tuple(sorted(set(predicted))),
         )
 
     def __call__(self, text: str) -> List[str]:
@@ -310,11 +352,16 @@ class NemoDictionaryIpaG2p(DictionaryIpaG2p):
 
     mode = "context_aware_nemo_ipa_g2p"
 
-    def __init__(self, nemo_g2p, resolver: Optional[ContextualHeteronymResolver] = None) -> None:
-        super().__init__(resolver=resolver)
+    def __init__(
+        self,
+        nemo_g2p,
+        resolver: Optional[ContextualHeteronymResolver] = None,
+        oov_predictor: Any = None,
+    ) -> None:
+        super().__init__(resolver=resolver, oov_predictor=oov_predictor)
         self.nemo_g2p = nemo_g2p
 
-    def _lookup_non_heteronym(self, word: str) -> Tuple[str, bool]:
+    def _lookup_non_heteronym(self, word: str) -> Tuple[str, str]:
         output = self.nemo_g2p(word)
         if isinstance(output, str):
             items = [output]
@@ -328,8 +375,12 @@ class NemoDictionaryIpaG2p(DictionaryIpaG2p):
                 break
             cleaned.append(str(item))
         ipa = "".join(cleaned).strip()
-        trusted = bool(ipa) and ipa.lower() != word.lower()
-        return (ipa or word, trusted)
+        # NeMo IpaG2p is dictionary-backed: for an OOV spelling it echoes the
+        # graphemes back unchanged. That is not a pronunciation, so hand the
+        # word to the predictive fallback rather than trusting the echo.
+        if ipa and ipa.lower() != word.lower():
+            return ipa, "trusted"
+        return self._predict_oov(word)
 
 
 def load_g2p_engine() -> None:
@@ -342,6 +393,13 @@ def load_g2p_engine() -> None:
         sys.path.insert(0, str(G2P_DIR))
 
     resolver = ContextualHeteronymResolver()
+
+    # Predictive fallback for out-of-vocabulary spellings. Untrusted by design
+    # and optional: if it can't load, OOV words keep their previous fallback.
+    from oov_g2p import load_oov_predictor
+
+    oov_predictor = load_oov_predictor()
+
     try:
         from nemo.collections.tts.g2p.models.i18n_ipa import IpaG2p
 
@@ -352,11 +410,13 @@ def load_g2p_engine() -> None:
             use_chars=False,
             use_stresses=True,
         )
-        g2p_engine = NemoDictionaryIpaG2p(backend, resolver=resolver)
+        g2p_engine = NemoDictionaryIpaG2p(
+            backend, resolver=resolver, oov_predictor=oov_predictor
+        )
     except Exception as exc:
         print("NeMo IpaG2p could not be loaded. Using context-aware dictionary fallback.")
         print("Reason:", repr(exc))
-        g2p_engine = DictionaryIpaG2p(resolver=resolver)
+        g2p_engine = DictionaryIpaG2p(resolver=resolver, oov_predictor=oov_predictor)
     g2p_mode = g2p_engine.mode
 
 
@@ -374,7 +434,12 @@ def g2p_convert_trusted(text: str) -> str:
     """Text -> IPA, rejecting references unsafe for exercise verification."""
     result = g2p_convert_with_metadata(text)
     if not result.reference_g2p_trusted:
-        details = result.unresolved_heteronyms + result.unsupported_heteronyms + result.oov_words
+        details = (
+            result.unresolved_heteronyms
+            + result.unsupported_heteronyms
+            + result.oov_words
+            + result.predicted_words
+        )
         raise UntrustedReferenceG2PError(
             "Reference G2P is unresolved or unsupported: " + ", ".join(details)
         )

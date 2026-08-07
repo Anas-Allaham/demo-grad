@@ -638,6 +638,7 @@ def analyze():
             *(f"unresolved:{word}" for word in reference.unresolved_heteronyms),
             *(f"unsupported:{word}" for word in reference.unsupported_heteronyms),
             *(f"oov:{word}" for word in reference.oov_words),
+            *(f"predicted:{word}" for word in reference.predicted_words),
         ]
         reference_reason = ",".join(reference_reason_parts) or None
         user_row = db.get_or_create_user(profile_name) if profile_name else None
